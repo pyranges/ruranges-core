@@ -1,0 +1,16 @@
+[package]
+name = "ruranges-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Core Rust interval algorithms extracted from ruranges"
+repository = "https://github.com/pyranges/ruranges-core"
+
+[lib]
+name = "ruranges_core"
+crate-type = ["rlib"]
+
+[dependencies]
+radsort = "0.1.1"
+rustc-hash = "2.1.0"
+num-traits = "0.2.19"
