@@ -32,6 +32,7 @@ fn sorted_records<C: GroupType, T: PositionType>(
     }
 
     sort_by_key(&mut records, |r| (r.group, r.start, r.end, r.idx));
+
     records
 }
 
@@ -351,7 +352,7 @@ pub fn overlaps<C: GroupType, T: PositionType>(
     );
 
     if sort_output {
-        pairs.sort_by_key(|p| (p.idx, p.idx2));
+        sort_by_key(&mut pairs, |p| (p.idx, p.idx2));
     }
 
     pairs.into_iter().map(|pair| (pair.idx, pair.idx2)).unzip()

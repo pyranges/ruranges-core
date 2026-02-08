@@ -272,7 +272,7 @@ pub fn build_sorted_groups<C: GroupType>(chrs: &[C]) -> Vec<u32> {
         })
         .collect();
 
-    out.sort_by_key(|e| e.chr);
+    sort_by_key(&mut out, |e| e.chr);
 
     // take the chromosome field, cast to u32, collect -----------------------
     out.into_iter().map(|e| e.idx).collect()
