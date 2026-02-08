@@ -1,36 +1,326 @@
 use std::str::FromStr;
-use std::time::{Duration, Instant};
 
 use radsort::sort_by_key;
-use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::helpers::{keep_first_by_idx, keep_last_by_idx};
-use crate::ruranges_structs::{
-    GroupType, MaxEvent, MinEvent, OverlapPair, OverlapType, PositionType,
-};
-use crate::sorts::{
-    self, build_sorted_events_single_collection_separate_outputs,
-    build_sorted_maxevents_with_starts_ends,
-};
+use crate::ruranges_structs::{GroupType, OverlapPair, OverlapType, PositionType};
 
-/// Perform a four-way merge sweep to find cross overlaps.
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum WhichList {
-    StartSet1,
-    EndSet1,
-    StartSet2,
-    EndSet2,
+#[derive(Copy, Clone, Debug)]
+struct IntervalRecord<C: GroupType, T: PositionType> {
+    group: C,
+    start: T,
+    end: T,
+    idx: u32,
 }
 
-impl WhichList {
-    #[inline]
-    fn is_start(&self) -> bool {
-        match self {
-            WhichList::StartSet1 | WhichList::StartSet2 => true,
-            WhichList::EndSet1 | WhichList::EndSet2 => false,
+fn sorted_records<C: GroupType, T: PositionType>(
+    groups: &[C],
+    starts: &[T],
+    ends: &[T],
+) -> Vec<IntervalRecord<C, T>> {
+    debug_assert_eq!(groups.len(), starts.len(), "groups/starts length mismatch");
+    debug_assert_eq!(groups.len(), ends.len(), "groups/ends length mismatch");
+
+    let mut records = Vec::with_capacity(groups.len());
+
+    for idx in 0..groups.len() {
+        records.push(IntervalRecord {
+            group: groups[idx],
+            start: starts[idx],
+            end: ends[idx],
+            idx: idx as u32,
+        });
+    }
+
+    sort_by_key(&mut records, |r| (r.group, r.start, r.end, r.idx));
+    records
+}
+
+#[inline(always)]
+fn overlaps_with_slack<T: PositionType>(
+    query_start: T,
+    query_end: T,
+    target_start: T,
+    target_end: T,
+    slack: T,
+) -> bool {
+    query_start < target_end.saturating_add(slack) && target_start < query_end.saturating_add(slack)
+}
+
+#[inline(always)]
+fn query_contained_in_target_with_slack<T: PositionType>(
+    query_start: T,
+    query_end: T,
+    target_start: T,
+    target_end: T,
+    slack: T,
+) -> bool {
+    let query_start_slack = query_start.saturating_sub(slack);
+    let query_end_slack = query_end.saturating_add(slack);
+    query_start_slack >= target_start && query_end_slack <= target_end
+}
+
+fn clear_active(active: &mut Vec<usize>, active_head: &mut usize) {
+    active.clear();
+    *active_head = 0;
+}
+
+fn collect_overlap_pairs<C: GroupType, T: PositionType>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    chrs2: &[C],
+    starts2: &[T],
+    ends2: &[T],
+    slack: T,
+    overlap_type: OverlapType,
+    contained: bool,
+) -> Vec<OverlapPair> {
+    let left = sorted_records(chrs, starts, ends);
+    let right = sorted_records(chrs2, starts2, ends2);
+
+    let n1 = left.len();
+    let n2 = right.len();
+
+    let mut pairs: Vec<OverlapPair> = Vec::new();
+
+    if n1 == 0 || n2 == 0 {
+        return pairs;
+    }
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    let mut active: Vec<usize> = Vec::new();
+    let mut active_head: usize = 0;
+
+    while i < n1 && j < n2 {
+        let g1 = left[i].group;
+        let g2 = right[j].group;
+
+        if g1 < g2 {
+            let group = g1;
+            while i < n1 && left[i].group == group {
+                i += 1;
+            }
+            continue;
+        }
+
+        if g2 < g1 {
+            let group = g2;
+            while j < n2 && right[j].group == group {
+                j += 1;
+            }
+            continue;
+        }
+
+        let group = g1;
+
+        let i0 = i;
+        while i < n1 && left[i].group == group {
+            i += 1;
+        }
+        let i1 = i;
+
+        let j0 = j;
+        while j < n2 && right[j].group == group {
+            j += 1;
+        }
+        let j1 = j;
+
+        clear_active(&mut active, &mut active_head);
+
+        let mut jr = j0;
+
+        for il in i0..i1 {
+            let query = left[il];
+            if contained {
+                let query_start_slack = query.start.saturating_sub(slack);
+
+                // Match legacy containment sweep: target must already be active when
+                // the query start event is processed.
+                while jr < j1 && right[jr].start < query_start_slack {
+                    active.push(jr);
+                    jr += 1;
+                }
+
+                while active_head < active.len() {
+                    let r = active[active_head];
+                    if right[r].end <= query_start_slack {
+                        active_head += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if active_head > 0 && active_head * 2 >= active.len() {
+                    active.drain(0..active_head);
+                    active_head = 0;
+                }
+
+                match overlap_type {
+                    OverlapType::All => {
+                        for idx in active_head..active.len() {
+                            let target = right[active[idx]];
+                            if !query_contained_in_target_with_slack(
+                                query.start,
+                                query.end,
+                                target.start,
+                                target.end,
+                                slack,
+                            ) {
+                                continue;
+                            }
+
+                            pairs.push(OverlapPair {
+                                idx: query.idx,
+                                idx2: target.idx,
+                            });
+                        }
+                    }
+                    OverlapType::First => {
+                        for idx in active_head..active.len() {
+                            let target = right[active[idx]];
+                            if !query_contained_in_target_with_slack(
+                                query.start,
+                                query.end,
+                                target.start,
+                                target.end,
+                                slack,
+                            ) {
+                                continue;
+                            }
+
+                            pairs.push(OverlapPair {
+                                idx: query.idx,
+                                idx2: target.idx,
+                            });
+                            break;
+                        }
+                    }
+                    OverlapType::Last => {
+                        let mut last_target: Option<IntervalRecord<C, T>> = None;
+
+                        for idx in active_head..active.len() {
+                            let target = right[active[idx]];
+                            if !query_contained_in_target_with_slack(
+                                query.start,
+                                query.end,
+                                target.start,
+                                target.end,
+                                slack,
+                            ) {
+                                continue;
+                            }
+
+                            last_target = Some(target);
+                        }
+
+                        if let Some(target) = last_target {
+                            pairs.push(OverlapPair {
+                                idx: query.idx,
+                                idx2: target.idx,
+                            });
+                        }
+                    }
+                }
+
+                continue;
+            }
+
+            let query_end_slack = query.end.saturating_add(slack);
+
+            while jr < j1 && right[jr].start < query_end_slack {
+                active.push(jr);
+                jr += 1;
+            }
+
+            while active_head < active.len() {
+                let r = active[active_head];
+                if right[r].end.saturating_add(slack) <= query.start {
+                    active_head += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if active_head > 0 && active_head * 2 >= active.len() {
+                active.drain(0..active_head);
+                active_head = 0;
+            }
+
+            match overlap_type {
+                OverlapType::All => {
+                    for idx in active_head..active.len() {
+                        let target = right[active[idx]];
+
+                        if !overlaps_with_slack(
+                            query.start,
+                            query.end,
+                            target.start,
+                            target.end,
+                            slack,
+                        ) {
+                            continue;
+                        }
+
+                        pairs.push(OverlapPair {
+                            idx: query.idx,
+                            idx2: target.idx,
+                        });
+                    }
+                }
+                OverlapType::First => {
+                    for idx in active_head..active.len() {
+                        let target = right[active[idx]];
+
+                        if !overlaps_with_slack(
+                            query.start,
+                            query.end,
+                            target.start,
+                            target.end,
+                            slack,
+                        ) {
+                            continue;
+                        }
+
+                        pairs.push(OverlapPair {
+                            idx: query.idx,
+                            idx2: target.idx,
+                        });
+                        break;
+                    }
+                }
+                OverlapType::Last => {
+                    let mut last_target: Option<IntervalRecord<C, T>> = None;
+
+                    for idx in active_head..active.len() {
+                        let target = right[active[idx]];
+
+                        if !overlaps_with_slack(
+                            query.start,
+                            query.end,
+                            target.start,
+                            target.end,
+                            slack,
+                        ) {
+                            continue;
+                        }
+
+                        last_target = Some(target);
+                    }
+
+                    if let Some(target) = last_target {
+                        pairs.push(OverlapPair {
+                            idx: query.idx,
+                            idx2: target.idx,
+                        });
+                    }
+                }
+            }
         }
     }
+
+    pairs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48,86 +338,23 @@ pub fn overlaps<C: GroupType, T: PositionType>(
 ) -> (Vec<u32>, Vec<u32>) {
     let overlap_type = OverlapType::from_str(overlap_type).expect("invalid overlap_type string");
 
-    let mut pairs = if contained {
-        let maxevents =
-            compute_sorted_maxevents(chrs, starts, ends, chrs2, starts2, ends2, slack, false);
-        sweep_line_overlaps_containment(maxevents)
-    } else {
-        sweep_line_overlaps(chrs, starts, ends, chrs2, starts2, ends2, slack)
-    };
+    let mut pairs = collect_overlap_pairs(
+        chrs,
+        starts,
+        ends,
+        chrs2,
+        starts2,
+        ends2,
+        slack,
+        overlap_type,
+        contained,
+    );
 
-    if sort_output || (overlap_type == OverlapType::First || overlap_type == OverlapType::Last) {
-        sort_by_key(&mut pairs, |p| p.idx);
-    }
-
-    match overlap_type {
-        OverlapType::All => {}
-        OverlapType::First => keep_first_by_idx(&mut pairs),
-        OverlapType::Last => keep_last_by_idx(&mut pairs),
+    if sort_output {
+        pairs.sort_by_key(|p| (p.idx, p.idx2));
     }
 
     pairs.into_iter().map(|pair| (pair.idx, pair.idx2)).unzip()
-}
-
-pub fn sweep_line_overlaps_set1<C: GroupType, T: PositionType>(
-    chrs: &[C],
-    starts: &[T],
-    ends: &[T],
-    chrs2: &[C],
-    starts2: &[T],
-    ends2: &[T],
-    slack: T,
-) -> Vec<u32> {
-    // We'll collect all cross overlaps here
-    let mut overlaps = Vec::new();
-
-    if chrs.is_empty() | chrs2.is_empty() {
-        return overlaps;
-    };
-
-    let events = sorts::build_sorted_events(chrs, starts, ends, chrs2, starts2, ends2, slack);
-
-    // Active sets
-    let mut active1 = FxHashSet::default();
-    let mut active2 = FxHashSet::default();
-
-    let mut current_chr = events.first().unwrap().chr;
-
-    // Process events in ascending order of position
-    for e in events {
-        if e.chr != current_chr {
-            active1.clear();
-            current_chr = e.chr;
-        }
-
-        if e.is_start {
-            // Interval is starting
-            if e.first_set {
-                // Overlaps with all currently active intervals in set2
-                for &_idx2 in active2.iter() {
-                    overlaps.push(e.idx);
-                }
-                // Now add it to active1
-                active1.insert(e.idx);
-            } else {
-                // Overlaps with all currently active intervals in set1
-                for &idx1 in active1.iter() {
-                    overlaps.push(idx1);
-                }
-                // Now add it to active2
-                active2.insert(e.idx);
-            }
-        } else {
-            // Interval is ending
-            if e.first_set {
-                active1.remove(&e.idx);
-            } else {
-                active2.remove(&e.idx);
-            }
-        }
-    }
-
-    overlaps
 }
 
 pub fn count_overlaps<C: GroupType, T: PositionType>(
@@ -139,385 +366,102 @@ pub fn count_overlaps<C: GroupType, T: PositionType>(
     ends2: &[T],
     slack: T,
 ) -> Vec<u32> {
-    // We'll collect all cross overlaps here
-    let mut overlaps = vec![0; chrs.len()];
+    let left = sorted_records(chrs, starts, ends);
+    let right = sorted_records(chrs2, starts2, ends2);
 
-    if chrs.is_empty() | chrs2.is_empty() {
-        return overlaps;
-    };
+    let n1 = left.len();
+    let n2 = right.len();
 
-    let events = sorts::build_sorted_events(chrs, starts, ends, chrs2, starts2, ends2, slack);
+    let mut counts = vec![0_u32; n1];
 
-    // Active sets
-    let mut active1 = FxHashSet::default();
-    let mut active2 = FxHashSet::default();
+    if n1 == 0 || n2 == 0 {
+        return counts;
+    }
 
-    let mut current_chr = events.first().unwrap().chr;
+    let mut i = 0usize;
+    let mut j = 0usize;
 
-    // Process events in ascending order of position
-    for e in events {
-        if e.chr != current_chr {
-            active1.clear();
-            current_chr = e.chr;
+    let mut active: Vec<usize> = Vec::new();
+    let mut active_head: usize = 0;
+
+    while i < n1 && j < n2 {
+        let g1 = left[i].group;
+        let g2 = right[j].group;
+
+        if g1 < g2 {
+            let group = g1;
+            while i < n1 && left[i].group == group {
+                i += 1;
+            }
+            continue;
         }
 
-        if e.is_start {
-            // Interval is starting
-            if e.first_set {
-                // Overlaps with all currently active intervals in set2
-                for &_idx2 in active2.iter() {
-                    overlaps[e.idx as usize] += 1;
-                }
-                // Now add it to active1
-                active1.insert(e.idx);
-            } else {
-                // Overlaps with all currently active intervals in set1
-                for &idx1 in active1.iter() {
-                    overlaps[idx1 as usize] += 1;
-                }
-                // Now add it to active2
-                active2.insert(e.idx);
+        if g2 < g1 {
+            let group = g2;
+            while j < n2 && right[j].group == group {
+                j += 1;
             }
-        } else {
-            // Interval is ending
-            if e.first_set {
-                active1.remove(&e.idx);
-            } else {
-                active2.remove(&e.idx);
+            continue;
+        }
+
+        let group = g1;
+
+        let i0 = i;
+        while i < n1 && left[i].group == group {
+            i += 1;
+        }
+        let i1 = i;
+
+        let j0 = j;
+        while j < n2 && right[j].group == group {
+            j += 1;
+        }
+        let j1 = j;
+
+        clear_active(&mut active, &mut active_head);
+
+        let mut jr = j0;
+
+        for il in i0..i1 {
+            let query = left[il];
+            let query_end_slack = query.end.saturating_add(slack);
+
+            while jr < j1 && right[jr].start < query_end_slack {
+                active.push(jr);
+                jr += 1;
             }
+
+            while active_head < active.len() {
+                let r = active[active_head];
+                if right[r].end.saturating_add(slack) <= query.start {
+                    active_head += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if active_head > 0 && active_head * 2 >= active.len() {
+                active.drain(0..active_head);
+                active_head = 0;
+            }
+
+            let mut count = 0_u32;
+
+            for idx in active_head..active.len() {
+                let target = right[active[idx]];
+
+                if overlaps_with_slack(query.start, query.end, target.start, target.end, slack) {
+                    count = count.saturating_add(1);
+                }
+            }
+
+            counts[query.idx as usize] = count;
         }
     }
 
-    overlaps
+    counts
 }
 
-pub fn sweep_line_overlaps_overlap_pair<C: GroupType, T: PositionType>(
-    sorted_starts: &[MinEvent<C, T>],  // set 1 starts
-    sorted_ends: &[MinEvent<C, T>],    // set 1 ends
-    sorted_starts2: &[MinEvent<C, T>], // set 2 starts
-    sorted_ends2: &[MinEvent<C, T>],   // set 2 ends
-) -> Vec<OverlapPair> {
-    let mut out_idxs = Vec::new();
-    // Quick check: if no starts exist in either set, no overlaps.
-    if sorted_starts.is_empty() || sorted_starts2.is_empty() {
-        return out_idxs;
-    }
-    // Active intervals for set1, set2
-    let mut active1 = FxHashSet::default();
-    let mut active2 = FxHashSet::default();
-    // Pointers into each list
-    let mut i1 = 0usize; // pointer into sorted_starts  (set 1)
-    let mut i2 = 0usize; // pointer into sorted_starts2 (set 2)
-    let mut i3 = 0usize; // pointer into sorted_ends    (set 1)
-    let mut i4 = 0usize; // pointer into sorted_ends2   (set 2)
-                         // Figure out the very first chromosome we encounter (if any):
-                         // We'll look at the heads of each list and pick the lexicographically smallest.
-    let first_candidate = pick_winner_of_four(
-        sorted_starts.get(i1).map(|e| (WhichList::StartSet1, e)),
-        sorted_starts2.get(i2).map(|e| (WhichList::StartSet2, e)),
-        sorted_ends.get(i3).map(|e| (WhichList::EndSet1, e)),
-        sorted_ends2.get(i4).map(|e| (WhichList::EndSet2, e)),
-    );
-    // Unwrap the first candidate’s chromosome
-    let mut current_chr = first_candidate.unwrap().1.chr;
-    // Main sweep-line loop
-    while i1 < sorted_starts.len()
-        || i2 < sorted_starts2.len()
-        || i3 < sorted_ends.len()
-        || i4 < sorted_ends2.len()
-    {
-        let (which_list, event) = if let Some((which_list, event)) = pick_winner_of_four(
-            sorted_starts.get(i1).map(|e| (WhichList::StartSet1, e)),
-            sorted_starts2.get(i2).map(|e| (WhichList::StartSet2, e)),
-            sorted_ends.get(i3).map(|e| (WhichList::EndSet1, e)),
-            sorted_ends2.get(i4).map(|e| (WhichList::EndSet2, e)),
-        ) {
-            (which_list, event)
-        } else {
-            break;
-        };
-        // If we've moved to a new chromosome, reset active sets
-        if event.chr != current_chr {
-            active1.clear();
-            active2.clear();
-            current_chr = event.chr;
-        }
-        // Advance the pointer for whichever list we took an event from
-        match which_list {
-            WhichList::StartSet1 => {
-                for &idx2 in active2.iter() {
-                    out_idxs.push(OverlapPair {
-                        idx: event.idx,
-                        idx2: idx2,
-                    })
-                }
-                // Now add it to active1
-                active1.insert(event.idx);
-                i1 += 1
-            }
-            WhichList::StartSet2 => {
-                for &idx1 in active1.iter() {
-                    out_idxs.push(OverlapPair {
-                        idx: idx1,
-                        idx2: event.idx,
-                    })
-                }
-                // Now add it to active2
-                active2.insert(event.idx);
-                i2 += 1
-            }
-            WhichList::EndSet1 => {
-                active1.remove(&event.idx);
-                i3 += 1
-            }
-            WhichList::EndSet2 => {
-                active2.remove(&event.idx);
-                i4 += 1
-            }
-        }
-    }
-    out_idxs
-}
-
-pub fn sweep_line_overlaps_containment<C: GroupType, T: PositionType>(
-    events: Vec<MaxEvent<C, T>>,
-) -> (Vec<OverlapPair>) {
-    // We'll collect all cross overlaps here
-    let mut overlaps = Vec::new();
-
-    if events.is_empty() {
-        return overlaps;
-    };
-
-    // Active sets
-    let mut active1 = FxHashMap::default();
-    let mut active2 = FxHashMap::default();
-
-    let mut current_chr = events.first().unwrap().chr;
-
-    // Process events in ascending order of position
-    for e in events {
-        if e.chr != current_chr {
-            active1.clear();
-            active2.clear();
-            current_chr = e.chr;
-        }
-
-        if e.is_start {
-            // Interval is starting
-            if e.first_set {
-                // Overlaps with all currently active intervals in set2
-                for (&idx2, &(start2, end2)) in active2.iter() {
-                    if e.start >= start2 && e.end <= end2 {
-                        overlaps.push(OverlapPair {
-                            idx: e.idx,
-                            idx2: idx2,
-                        });
-                    };
-                }
-                // Now add it to active1
-                active1.insert(e.idx, (e.start, e.end));
-            } else {
-                // Overlaps with all currently active intervals in set1
-                for (&idx, &(start, end)) in active1.iter() {
-                    if e.start <= start && e.end >= end {
-                        overlaps.push(OverlapPair {
-                            idx: idx,
-                            idx2: e.idx,
-                        });
-                    };
-                }
-                // Now add it to active2
-                active2.insert(e.idx, (e.start, e.end));
-            }
-        } else {
-            // Interval is ending
-            if e.first_set {
-                active1.remove(&e.idx);
-            } else {
-                active2.remove(&e.idx);
-            }
-        }
-    }
-
-    overlaps
-}
-
-fn pick_winner_of_four<'a, C: GroupType, T: PositionType>(
-    s1: Option<(WhichList, &'a MinEvent<C, T>)>,
-    s2: Option<(WhichList, &'a MinEvent<C, T>)>,
-    e1: Option<(WhichList, &'a MinEvent<C, T>)>,
-    e2: Option<(WhichList, &'a MinEvent<C, T>)>,
-) -> Option<(WhichList, &'a MinEvent<C, T>)> {
-    let starts_winner = pick_winner_of_two_choose_first_if_equal(s1, e1);
-    let ends_winner = pick_winner_of_two_choose_first_if_equal(s2, e2);
-    pick_winner_of_two_choose_first_if_equal(starts_winner, ends_winner)
-}
-
-fn pick_winner_of_two_choose_first_if_equal<'a, C: GroupType, T: PositionType>(
-    a: Option<(WhichList, &'a MinEvent<C, T>)>,
-    b: Option<(WhichList, &'a MinEvent<C, T>)>,
-) -> Option<(WhichList, &'a MinEvent<C, T>)> {
-    match (a, b) {
-        (None, None) => None,
-        (Some(x), None) => Some(x),
-        (None, Some(y)) => Some(y),
-        (Some((wh_a, ev_a)), Some((wh_b, ev_b))) => {
-            // Compare by chromosome
-            if ev_a.chr < ev_b.chr {
-                return Some((wh_a, ev_a));
-            } else if ev_b.chr < ev_a.chr {
-                return Some((wh_b, ev_b));
-            }
-            // Same chr => compare by pos
-            if ev_a.pos < ev_b.pos {
-                return Some((wh_a, ev_a));
-            } else if ev_b.pos < ev_a.pos {
-                return Some((wh_b, ev_b));
-            }
-            // Same (chr, pos) => tie break: end < start
-            let a_is_end = !wh_a.is_start();
-            let b_is_end = !wh_b.is_start();
-            match (a_is_end, b_is_end) {
-                // If both are ends or both are starts, just pick either. We'll pick `a`.
-                (true, true) | (false, false) => Some((wh_a, ev_a)),
-                // If only one is end, that one is “smaller”
-                (true, false) => Some((wh_a, ev_a)),
-                (false, true) => Some((wh_b, ev_b)),
-            }
-        }
-    }
-}
-
-pub fn compute_sorted_events<C: GroupType, T: PositionType>(
-    chrs: &[C],
-    starts: &[T],
-    ends: &[T],
-    slack: T,
-    invert: bool,
-) -> (Vec<MinEvent<C, T>>, Vec<MinEvent<C, T>>) {
-    if !invert {
-        // "Normal" path
-        let sorted_starts =
-            build_sorted_events_single_collection_separate_outputs(chrs, starts, slack);
-        let sorted_ends =
-            build_sorted_events_single_collection_separate_outputs(chrs, ends, T::zero());
-        (sorted_starts, sorted_ends)
-    } else {
-        // "Inverted" path
-        let new_starts: Vec<_> = starts.iter().map(|&v| -v).collect();
-        let new_ends: Vec<_> = ends.iter().map(|&v| -v).collect();
-
-        let sorted_starts =
-            build_sorted_events_single_collection_separate_outputs(chrs, &new_ends, slack);
-        let sorted_ends =
-            build_sorted_events_single_collection_separate_outputs(chrs, &new_starts, T::zero());
-        (sorted_starts, sorted_ends)
-    }
-}
-
-pub fn compute_sorted_maxevents<C: GroupType, T: PositionType>(
-    chrs: &[C],
-    starts: &[T],
-    ends: &[T],
-    chrs2: &[C],
-    starts2: &[T],
-    ends2: &[T],
-    slack: T,
-    invert: bool,
-) -> Vec<MaxEvent<C, T>> {
-    if !invert {
-        // "Normal" path
-        build_sorted_maxevents_with_starts_ends(chrs, starts, ends, chrs2, starts2, ends2, slack)
-    } else {
-        // "Inverted" path
-        let new_starts_vec: Vec<T> = starts.iter().map(|&v| -v).collect();
-        let new_starts = new_starts_vec.as_slice();
-        let new_ends_vec: Vec<T> = ends.iter().map(|&v| -v).collect();
-        let new_ends = new_ends_vec.as_slice();
-
-        let new_starts_vec2: Vec<T> = starts2.iter().map(|&v| -v).collect();
-        let new_starts2 = new_starts_vec2.as_slice();
-        let new_ends_vec2: Vec<T> = ends2.iter().map(|&v| -v).collect();
-        let new_ends2 = new_ends_vec2.as_slice();
-        build_sorted_maxevents_with_starts_ends(
-            chrs,
-            new_ends,
-            new_starts,
-            chrs2,
-            new_ends2,
-            new_starts2,
-            slack,
-        )
-    }
-}
-
-pub fn sweep_line_overlaps<C: GroupType, T: PositionType>(
-    chrs: &[C],
-    starts: &[T],
-    ends: &[T],
-    chrs2: &[C],
-    starts2: &[T],
-    ends2: &[T],
-    slack: T,
-) -> (Vec<OverlapPair>) {
-    // We'll collect all cross overlaps here
-    let mut overlaps = Vec::new();
-
-    let events = sorts::build_sorted_events(chrs, starts, ends, chrs2, starts2, ends2, slack);
-
-    if events.is_empty() {
-        return overlaps;
-    };
-
-    // Active sets
-    let mut active1 = FxHashSet::default();
-    let mut active2 = FxHashSet::default();
-
-    let mut current_chr = events.first().unwrap().chr;
-
-    // Process events in ascending order of position
-    for e in events {
-        if e.chr != current_chr {
-            active1.clear();
-            active2.clear();
-            current_chr = e.chr;
-        }
-
-        if e.is_start {
-            // Interval is starting
-            if e.first_set {
-                // Overlaps with all currently active intervals in set2
-                for &idx2 in active2.iter() {
-                    overlaps.push(OverlapPair {
-                        idx: e.idx,
-                        idx2: idx2,
-                    });
-                }
-                // Now add it to active1
-                active1.insert(e.idx);
-            } else {
-                // Overlaps with all currently active intervals in set1
-                for &idx in active1.iter() {
-                    overlaps.push(OverlapPair {
-                        idx: idx,
-                        idx2: e.idx,
-                    });
-                }
-                active2.insert(e.idx);
-            }
-        } else {
-            // Interval is ending
-            if e.first_set {
-                active1.remove(&e.idx);
-            } else {
-                active2.remove(&e.idx);
-            }
-        }
-    }
-
-    overlaps
-}
 #[cfg(test)]
 mod tests {
     use super::overlaps;
@@ -544,30 +488,43 @@ mod tests {
     }
 
     #[test]
-    fn overlaps_first_and_last_pick_one_match_per_query() {
-        let groups: [Group; 3] = [1, 1, 1];
-        let starts: [Pos; 3] = [1, 10, 30];
-        let ends: [Pos; 3] = [5, 20, 40];
+    fn overlaps_issue_23_preserves_order_for_all_first_last() {
+        let groups = vec![1_u32; 10];
+        let starts: Vec<Pos> = vec![97, 981, 1000, 1227, 1409, 3889, 4398, 4815, 5004, 5047];
+        let ends: Vec<Pos> = vec![1097, 1981, 2000, 2227, 2409, 4889, 5398, 5815, 6004, 6047];
 
-        let groups2: [Group; 4] = [1, 1, 1, 1];
-        let starts2: [Pos; 4] = [3, 11, 18, 35];
-        let ends2: [Pos; 4] = [4, 12, 19, 36];
+        let groups2 = vec![1_u32; 10];
+        let starts2: Vec<Pos> = vec![1476, 2110, 2823, 3547, 3578, 4295, 5184, 5545, 7117, 7190];
+        let ends2: Vec<Pos> = vec![2476, 3110, 3823, 4547, 4578, 5295, 6184, 6545, 8117, 8190];
+
+        let (all_idx1, all_idx2) = overlaps(
+            &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "all", true, false,
+        );
+
+        assert_eq!(
+            all_idx1,
+            vec![1, 2, 3, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9]
+        );
+        assert_eq!(
+            all_idx2,
+            vec![0, 0, 0, 1, 0, 1, 3, 4, 5, 3, 4, 5, 6, 5, 6, 7, 5, 6, 7, 5, 6, 7]
+        );
 
         let (first_idx1, first_idx2) = overlaps(
             &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "first", true, false,
         );
-        assert_eq!(first_idx1, vec![0, 1, 2]);
-        assert_eq!(first_idx2, vec![0, 1, 3]);
+        assert_eq!(first_idx1, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(first_idx2, vec![0, 0, 0, 0, 3, 3, 5, 5, 5]);
 
         let (last_idx1, last_idx2) = overlaps(
             &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "last", true, false,
         );
-        assert_eq!(last_idx1, vec![0, 1, 2]);
-        assert_eq!(last_idx2, vec![0, 2, 3]);
+        assert_eq!(last_idx1, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(last_idx2, vec![0, 0, 1, 1, 5, 6, 7, 7, 7]);
     }
 
     #[test]
-    fn overlaps_contained_filters_to_contained_query_intervals() {
+    fn overlaps_contained_filters_to_left_contained_in_right() {
         let groups: [Group; 2] = [1, 1];
         let starts: [Pos; 2] = [10, 10];
         let ends: [Pos; 2] = [12, 30];
@@ -582,6 +539,42 @@ mod tests {
 
         assert_eq!(idx1, vec![0, 1]);
         assert_eq!(idx2, vec![0, 0]);
+    }
+
+    #[test]
+    fn overlaps_contained_with_negative_slack_matches_legacy_behavior() {
+        let groups: [Group; 2] = [1, 1];
+        let starts: [Pos; 2] = [1, 4];
+        let ends: [Pos; 2] = [3, 9];
+
+        let groups2: [Group; 3] = [1, 1, 1];
+        let starts2: [Pos; 3] = [1, 2, 2];
+        let ends2: [Pos; 3] = [10, 3, 9];
+
+        let (idx1, idx2) = overlaps(
+            &groups, &starts, &ends, &groups2, &starts2, &ends2, -2, "first", true, true,
+        );
+
+        assert_eq!(idx1, vec![0, 1]);
+        assert_eq!(idx2, vec![0, 0]);
+    }
+
+    #[test]
+    fn overlaps_handles_unsorted_input() {
+        let groups: [Group; 3] = [1, 1, 1];
+        let starts: [Pos; 3] = [10, 0, 20];
+        let ends: [Pos; 3] = [12, 5, 30];
+
+        let groups2: [Group; 2] = [1, 1];
+        let starts2: [Pos; 2] = [11, 3];
+        let ends2: [Pos; 2] = [13, 4];
+
+        let (idx1, idx2) = overlaps(
+            &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "all", true, false,
+        );
+
+        assert_eq!(idx1, vec![0, 1]);
+        assert_eq!(idx2, vec![0, 1]);
     }
 
     #[test]
@@ -605,49 +598,5 @@ mod tests {
         );
         assert_eq!(idx1_with_slack, vec![0]);
         assert_eq!(idx2_with_slack, vec![0]);
-    }
-
-    #[test]
-    fn overlaps_do_not_cross_groups() {
-        let groups: [Group; 1] = [1];
-        let starts: [Pos; 1] = [10];
-        let ends: [Pos; 1] = [20];
-
-        let groups2: [Group; 1] = [2];
-        let starts2: [Pos; 1] = [10];
-        let ends2: [Pos; 1] = [20];
-
-        let (idx1, idx2) = overlaps(
-            &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "all", true, false,
-        );
-
-        assert!(idx1.is_empty());
-        assert!(idx2.is_empty());
-    }
-
-    #[test]
-    fn overlaps_contained_with_first_and_last_returns_single_pair() {
-        let groups: [Group; 1] = [1];
-        let starts: [Pos; 1] = [10];
-        let ends: [Pos; 1] = [20];
-
-        let groups2: [Group; 2] = [1, 1];
-        let starts2: [Pos; 2] = [0, 5];
-        let ends2: [Pos; 2] = [30, 25];
-
-        let (first_idx1, first_idx2) = overlaps(
-            &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "first", true, true,
-        );
-        assert_eq!(first_idx1, vec![0]);
-        assert_eq!(first_idx2.len(), 1);
-
-        let (last_idx1, last_idx2) = overlaps(
-            &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "last", true, true,
-        );
-        assert_eq!(last_idx1, vec![0]);
-        assert_eq!(last_idx2.len(), 1);
-
-        assert!(first_idx2[0] <= 1);
-        assert!(last_idx2[0] <= 1);
     }
 }

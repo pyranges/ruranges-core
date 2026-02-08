@@ -1,9 +1,9 @@
-use std::{str::FromStr, time::Instant};
+use std::str::FromStr;
 
 use radsort::sort_by_key;
 
 use crate::{
-    overlaps::{self, sweep_line_overlaps, sweep_line_overlaps_overlap_pair},
+    overlaps::overlaps,
     ruranges_structs::{GroupType, MinEvent, Nearest, OverlapPair, PositionType},
     sorts::build_sorted_events_single_collection_separate_outputs,
 };
@@ -228,12 +228,13 @@ pub fn nearest<C: GroupType, T: PositionType>(
         build_sorted_events_single_collection_separate_outputs(chrs2, ends2, T::zero());
 
     let overlaps = if include_overlaps {
-        sweep_line_overlaps_overlap_pair(
-            &sorted_starts,
-            &sorted_ends,
-            &sorted_starts2,
-            &sorted_ends2,
-        )
+        let (idx, idx2) = overlaps(
+            chrs, starts, ends, chrs2, starts2, ends2, slack, "all", true, false,
+        );
+        idx.into_iter()
+            .zip(idx2)
+            .map(|(idx, idx2)| OverlapPair { idx, idx2 })
+            .collect()
     } else {
         Vec::new()
     };
