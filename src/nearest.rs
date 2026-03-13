@@ -118,7 +118,7 @@ pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
 
         // Move `j` forward so that:
         // - All start events at indices < j have start.chr < end_chr
-        //   OR (start.chr == end_chr && start.pos < end_pos).
+        //   OR (start.chr == end_chr && start.pos <= end_pos).
         // - Equivalently, sorted_starts2[j] is the *first* event that is NOT
         //   strictly to the left of `end`.
         while j < n_starts {
@@ -126,8 +126,8 @@ pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
             if start.chr < end_chr {
                 // still a smaller chromosome => definitely to the left
                 j += 1;
-            } else if start.chr == end_chr && start.pos < end_pos {
-                // same chrom, smaller position => to the left
+            } else if start.chr == end_chr && start.pos <= end_pos {
+                // same chrom, smaller/equal position => to the left (touching counts)
                 j += 1;
             } else {
                 // we've reached a start that is not to the left
@@ -451,4 +451,47 @@ pub fn merge_three_way_by_index_distance<T: PositionType>(
     }
 
     (out_idxs, out_idxs2, out_distances)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nearest;
+
+    #[test]
+    fn nearest_backward_includes_touching_left_interval_with_distance_one() {
+        let chrs = vec![1_u32];
+        let starts = vec![5_i64];
+        let ends = vec![10_i64];
+
+        let chrs2 = vec![1_u32];
+        let starts2 = vec![1_i64];
+        let ends2 = vec![5_i64];
+
+        let (idx, idx2, dist) = nearest(
+            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "backward",
+        );
+
+        assert_eq!(idx, vec![0]);
+        assert_eq!(idx2, vec![0]);
+        assert_eq!(dist, vec![1]);
+    }
+
+    #[test]
+    fn nearest_forward_keeps_touching_right_interval_with_distance_one() {
+        let chrs = vec![1_u32];
+        let starts = vec![1_i64];
+        let ends = vec![5_i64];
+
+        let chrs2 = vec![1_u32];
+        let starts2 = vec![5_i64];
+        let ends2 = vec![10_i64];
+
+        let (idx, idx2, dist) = nearest(
+            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "forward",
+        );
+
+        assert_eq!(idx, vec![0]);
+        assert_eq!(idx2, vec![0]);
+        assert_eq!(dist, vec![1]);
+    }
 }
