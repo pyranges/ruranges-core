@@ -137,9 +137,9 @@ fn collect_overlap_pairs<C: GroupType, T: PositionType>(
             if contained {
                 let query_start_slack = query.start.saturating_sub(slack);
 
-                // Match legacy containment sweep: target must already be active when
-                // the query start event is processed.
-                while jr < j1 && right[jr].start < query_start_slack {
+                // A target that starts exactly at the query boundary must be active
+                // for containment checks.
+                while jr < j1 && right[jr].start <= query_start_slack {
                     active.push(jr);
                     jr += 1;
                 }
@@ -533,6 +533,24 @@ mod tests {
         let groups2: [Group; 2] = [1, 1];
         let starts2: [Pos; 2] = [9, 11];
         let ends2: [Pos; 2] = [40, 29];
+
+        let (idx1, idx2) = overlaps(
+            &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "all", true, true,
+        );
+
+        assert_eq!(idx1, vec![0, 1]);
+        assert_eq!(idx2, vec![0, 0]);
+    }
+
+    #[test]
+    fn overlaps_contained_includes_targets_with_same_start() {
+        let groups: [Group; 2] = [1, 1];
+        let starts: [Pos; 2] = [1, 6];
+        let ends: [Pos; 2] = [3, 9];
+
+        let groups2: [Group; 1] = [1];
+        let starts2: [Pos; 1] = [1];
+        let ends2: [Pos; 1] = [9];
 
         let (idx1, idx2) = overlaps(
             &groups, &starts, &ends, &groups2, &starts2, &ends2, 0, "all", true, true,
