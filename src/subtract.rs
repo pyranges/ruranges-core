@@ -15,6 +15,7 @@ pub fn sweep_line_subtract<G: GroupType, T: PositionType>(
     chrs2: &[G],
     starts2: &[T],
     ends2: &[T],
+    sort_output: bool,
 ) -> (Vec<u32>, Vec<T>, Vec<T>) {
     // If either set is empty, set1 is unchanged (or trivially subtracted).
     if chrs1.is_empty() || chrs2.is_empty() {
@@ -148,7 +149,9 @@ pub fn sweep_line_subtract<G: GroupType, T: PositionType>(
 
         // 3. Move on to the next event
     }
-    sort_by_key(&mut out_events, |i| i.idx);
+    if sort_output {
+        sort_by_key(&mut out_events, |i| i.idx);
+    }
 
     // No final cleanup is strictly necessary if every set1 interval has a corresponding end event.
     let mut out_idxs = Vec::with_capacity(out_events.len());

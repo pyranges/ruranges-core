@@ -34,6 +34,7 @@ pub fn spliced_subseq<G: GroupType, T: PositionType>(
     start: T,
     end: Option<T>,
     force_plus_strand: bool,
+    sort_output: bool,
 ) -> (Vec<u32>, Vec<T>, Vec<T>, Vec<bool>) {
     // ────────────────────────── 1. pre-processing: apply global shift ─────
     let shift = global_shift(starts, ends);
@@ -185,7 +186,9 @@ pub fn spliced_subseq<G: GroupType, T: PositionType>(
     finalize_group(&mut group_buf);
 
     // restore original row order
-    sort_by_key(&mut out_recs, |r| r.idx);
+    if sort_output {
+        sort_by_key(&mut out_recs, |r| r.idx);
+    }
 
     // ───────── explode OutRec list into parallel result vectors ────────────
     let mut out_idxs = Vec::with_capacity(out_recs.len());
@@ -222,6 +225,7 @@ pub fn spliced_subseq_multi<G: GroupType, T: PositionType>(
     slice_starts: &[T],
     slice_ends: &[Option<T>],
     force_plus_strand: bool,
+    sort_output: bool,
 ) -> (Vec<u32>, Vec<T>, Vec<T>, Vec<bool>) {
     assert_eq!(chrs.len(), starts.len());
     assert_eq!(starts.len(), ends.len());
@@ -364,7 +368,9 @@ pub fn spliced_subseq_multi<G: GroupType, T: PositionType>(
     }
     finalize_group(&mut group_buf, current_slice_start, current_slice_end);
 
-    sort_by_key(&mut out_recs, |r| r.idx);
+    if sort_output {
+        sort_by_key(&mut out_recs, |r| r.idx);
+    }
 
     let mut out_idxs = Vec::with_capacity(out_recs.len());
     let mut out_starts = Vec::with_capacity(out_recs.len());

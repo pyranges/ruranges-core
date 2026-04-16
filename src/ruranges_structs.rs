@@ -6,7 +6,8 @@ pub trait PositionType:
     + Signed
     + Hash
     + Copy
-    + radsort::Key    + Copy
+    + radsort::Key
+    + Copy
     + PartialOrd
     + ToPrimitive
     + Zero
@@ -18,7 +19,8 @@ impl<T> PositionType for T where
         + Signed
         + Hash
         + Copy
-        + radsort::Key        + Copy
+        + radsort::Key
+        + Copy
         + PartialOrd
         + ToPrimitive
         + Zero

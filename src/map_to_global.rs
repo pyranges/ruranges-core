@@ -20,6 +20,7 @@ pub fn map_to_global<G: GroupType, T: PositionType>(
     ex_genome_end: &[T],
     ex_fwd: &[bool],
     q_fwd: &[bool],
+    sort_output: bool,
 ) -> (Vec<u32>, Vec<T>, Vec<T>, Vec<bool>) {
     // ------------------- sanity checks (debug-only) ------------------------
     debug_assert_eq!(ex_tx.len(), ex_local_start.len());
@@ -122,7 +123,9 @@ pub fn map_to_global<G: GroupType, T: PositionType>(
         }
     }
 
-    sort_by_key(&mut results, |i| i.idx);
+    if sort_output {
+        sort_by_key(&mut results, |i| i.idx);
+    }
 
     let mut out_idxs = Vec::with_capacity(results.len());
     let mut out_starts = Vec::with_capacity(results.len());

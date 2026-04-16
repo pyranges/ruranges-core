@@ -216,6 +216,7 @@ pub fn nearest<C: GroupType, T: PositionType>(
     k: usize,
     include_overlaps: bool,
     direction: &str,
+    sort_output: bool,
 ) -> (Vec<u32>, Vec<u32>, Vec<T>) {
     let dir = Direction::from_str(direction).unwrap();
 
@@ -253,7 +254,8 @@ pub fn nearest<C: GroupType, T: PositionType>(
         Vec::new()
     };
 
-    let merged = merge_three_way_by_index_distance(&overlaps, &nearest_left, &nearest_right, k);
+    let merged =
+        merge_three_way_by_index_distance(&overlaps, &nearest_left, &nearest_right, k, sort_output);
     merged
 }
 
@@ -267,6 +269,7 @@ pub fn merge_three_way_by_index_distance<T: PositionType>(
     nearest_left: &[Nearest<T>],  // sorted by (idx, distance)
     nearest_right: &[Nearest<T>], // sorted by (idx, distance)
     k: usize,
+    sort_output: bool,
 ) -> (Vec<u32>, Vec<u32>, Vec<T>) {
     // We'll return tuples: (idx, idx2, distance).
     // You can adapt if you want a custom struct instead.
@@ -438,7 +441,9 @@ pub fn merge_three_way_by_index_distance<T: PositionType>(
         // done collecting up to k distinct distances for this index
     }
 
-    sort_by_key(&mut results, |n| (n.idx, n.distance, n.idx2));
+    if sort_output {
+        sort_by_key(&mut results, |n| (n.idx, n.distance, n.idx2));
+    }
 
     let mut out_idxs = Vec::with_capacity(results.len());
     let mut out_idxs2 = Vec::with_capacity(results.len());
@@ -468,7 +473,7 @@ mod tests {
         let ends2 = vec![5_i64];
 
         let (idx, idx2, dist) = nearest(
-            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "backward",
+            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "backward", true,
         );
 
         assert_eq!(idx, vec![0]);
@@ -487,7 +492,7 @@ mod tests {
         let ends2 = vec![10_i64];
 
         let (idx, idx2, dist) = nearest(
-            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "forward",
+            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "forward", true,
         );
 
         assert_eq!(idx, vec![0]);

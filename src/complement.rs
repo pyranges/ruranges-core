@@ -13,6 +13,7 @@ pub fn sweep_line_non_overlaps<G: GroupType, T: PositionType>(
     starts2: &[T],
     ends2: &[T],
     slack: T,
+    sort_output: bool,
 ) -> Vec<u32> {
     let mut no_overlaps = Vec::new();
 
@@ -74,6 +75,8 @@ pub fn sweep_line_non_overlaps<G: GroupType, T: PositionType>(
         }
     }
 
-    radsort::sort(&mut no_overlaps);
+    if sort_output {
+        radsort::sort(&mut no_overlaps);
+    }
     no_overlaps
 }

@@ -5,7 +5,13 @@ use crate::{
     sorts::build_sorted_intervals,
 };
 
-pub fn max_disjoint<G, T>(groups: &[G], starts: &[T], ends: &[T], slack: T) -> Vec<u32>
+pub fn max_disjoint<G, T>(
+    groups: &[G],
+    starts: &[T],
+    ends: &[T],
+    slack: T,
+    sort_output: bool,
+) -> Vec<u32>
 where
     G: GroupType,
     T: PositionType,
@@ -46,6 +52,8 @@ where
         }
     }
 
-    sort(&mut output);
+    if sort_output {
+        sort(&mut output);
+    }
     output
 }
