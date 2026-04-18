@@ -14,3 +14,4 @@ crate-type = ["rlib"]
 radsort = "0.1.1"
 rustc-hash = "2.1.0"
 num-traits = "0.2.19"
+rayon = "1.10.0"
