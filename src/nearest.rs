@@ -205,7 +205,7 @@ impl FromStr for Direction {
     }
 }
 
-pub fn nearest<C: GroupType, T: PositionType>(
+pub fn nearest<C: GroupType + Sync + Send, T: PositionType + Sync + Send>(
     chrs: &[C],
     starts: &[T],
     ends: &[T],
