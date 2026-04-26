@@ -10,6 +10,7 @@ pub mod max_disjoint;
 pub mod merge;
 pub mod nearest;
 pub mod outside_bounds;
+pub mod overlap_indices;
 pub mod overlaps;
 pub mod ruranges_structs;
 pub mod sorts;
