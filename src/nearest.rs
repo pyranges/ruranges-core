@@ -215,52 +215,68 @@ pub fn nearest<C: GroupType, T: PositionType>(
     include_overlaps: bool,
     direction: &str,
     sort_output: bool,
-) -> (Vec<u32>, Vec<u32>, Vec<T>) {
+) -> (Vec<u32>, Vec<u32>, Vec<T>)
+where
+    C: Send + Sync,
+    T: Send + Sync,
+{
     let dir = Direction::from_str(direction).unwrap();
 
     let need_left = dir == Direction::Backward || dir == Direction::Any;
     let need_right = dir == Direction::Forward || dir == Direction::Any;
 
-    let overlaps = if include_overlaps {
-        let (idx, idx2) = overlaps(
-            chrs, starts, ends, chrs2, starts2, ends2, slack, "all", true, false,
-        );
-        idx.into_iter()
-            .zip(idx2)
-            .map(|(idx, idx2)| OverlapPair { idx, idx2 })
-            .collect()
-    } else {
-        Vec::new()
+    let compute_overlaps = || -> Vec<OverlapPair> {
+        if include_overlaps {
+            let (idx, idx2) = overlaps(
+                chrs, starts, ends, chrs2, starts2, ends2, slack, "all", true, false,
+            );
+            idx.into_iter()
+                .zip(idx2)
+                .map(|(idx, idx2)| OverlapPair { idx, idx2 })
+                .collect()
+        } else {
+            Vec::new()
+        }
     };
 
-    let nearest_left = if need_left {
-        let sorted_starts =
-            build_sorted_events_single_collection_separate_outputs(chrs, starts, slack);
-        let sorted_ends2 =
-            build_sorted_events_single_collection_separate_outputs(chrs2, ends2, T::zero());
-        let mut tmp = nearest_intervals_to_the_left(sorted_starts, sorted_ends2, k);
-        // Each `idx` is unique per row and produces one contiguous block whose
-        // distances are already non-decreasing (descending local_idx, growing
-        // `end_pos - start.pos + 1`). radsort is a stable LSD radix sort, so
-        // sorting by `n.idx` alone preserves the within-block distance order.
-        radsort::sort_by_key(&mut tmp, |n| n.idx);
-        tmp
-    } else {
-        Vec::new()
+    let compute_left = || -> Vec<Nearest<T>> {
+        if need_left {
+            let sorted_starts =
+                build_sorted_events_single_collection_separate_outputs(chrs, starts, slack);
+            let sorted_ends2 =
+                build_sorted_events_single_collection_separate_outputs(chrs2, ends2, T::zero());
+            let mut tmp = nearest_intervals_to_the_left(sorted_starts, sorted_ends2, k);
+            // Each `idx` is unique per row and produces one contiguous block whose
+            // distances are already non-decreasing (descending local_idx, growing
+            // `end_pos - start.pos + 1`). radsort is a stable LSD radix sort, so
+            // sorting by `n.idx` alone preserves the within-block distance order.
+            radsort::sort_by_key(&mut tmp, |n| n.idx);
+            tmp
+        } else {
+            Vec::new()
+        }
     };
 
-    let nearest_right = if need_right {
-        let sorted_ends =
-            build_sorted_events_single_collection_separate_outputs(chrs, ends, slack);
-        let sorted_starts2 =
-            build_sorted_events_single_collection_separate_outputs(chrs2, starts2, T::zero());
-        let mut tmp = nearest_intervals_to_the_right(sorted_ends, sorted_starts2, k);
-        // See comment above — stable sort by `n.idx` is sufficient.
-        radsort::sort_by_key(&mut tmp, |n| n.idx);
-        tmp
-    } else {
-        Vec::new()
+    let compute_right = || -> Vec<Nearest<T>> {
+        if need_right {
+            let sorted_ends =
+                build_sorted_events_single_collection_separate_outputs(chrs, ends, slack);
+            let sorted_starts2 =
+                build_sorted_events_single_collection_separate_outputs(chrs2, starts2, T::zero());
+            let mut tmp = nearest_intervals_to_the_right(sorted_ends, sorted_starts2, k);
+            // See comment above — stable sort by `n.idx` is sufficient.
+            radsort::sort_by_key(&mut tmp, |n| n.idx);
+            tmp
+        } else {
+            Vec::new()
+        }
     };
+
+    // Run the three independent producers in parallel via nested rayon::join.
+    // rayon::join is cheap on small inputs: the calling thread runs one closure
+    // inline and only yields the other for stealing if a worker is idle.
+    let ((overlaps, nearest_left), nearest_right) =
+        rayon::join(|| rayon::join(compute_overlaps, compute_left), compute_right);
 
     merge_three_way_by_index_distance(&overlaps, &nearest_left, &nearest_right, k, sort_output)
 }
