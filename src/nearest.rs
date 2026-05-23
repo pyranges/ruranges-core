@@ -241,10 +241,10 @@ where
 
     let compute_left = || -> Vec<Nearest<T>> {
         if need_left {
-            let sorted_starts =
-                build_sorted_events_single_collection_separate_outputs(chrs, starts, slack);
-            let sorted_ends2 =
-                build_sorted_events_single_collection_separate_outputs(chrs2, ends2, T::zero());
+            let (sorted_starts, sorted_ends2) = rayon::join(
+                || build_sorted_events_single_collection_separate_outputs(chrs, starts, slack),
+                || build_sorted_events_single_collection_separate_outputs(chrs2, ends2, T::zero()),
+            );
             let mut tmp = nearest_intervals_to_the_left(sorted_starts, sorted_ends2, k);
             // Each `idx` is unique per row and produces one contiguous block whose
             // distances are already non-decreasing (descending local_idx, growing
@@ -259,10 +259,10 @@ where
 
     let compute_right = || -> Vec<Nearest<T>> {
         if need_right {
-            let sorted_ends =
-                build_sorted_events_single_collection_separate_outputs(chrs, ends, slack);
-            let sorted_starts2 =
-                build_sorted_events_single_collection_separate_outputs(chrs2, starts2, T::zero());
+            let (sorted_ends, sorted_starts2) = rayon::join(
+                || build_sorted_events_single_collection_separate_outputs(chrs, ends, slack),
+                || build_sorted_events_single_collection_separate_outputs(chrs2, starts2, T::zero()),
+            );
             let mut tmp = nearest_intervals_to_the_right(sorted_ends, sorted_starts2, k);
             // See comment above — stable sort by `n.idx` is sufficient.
             radsort::sort_by_key(&mut tmp, |n| n.idx);
@@ -306,9 +306,13 @@ pub fn merge_three_way_by_index_distance<T: PositionType>(
         merge_inner(overlaps, nearest_left, nearest_right, k, |idx, idx2, distance| {
             results.push(Nearest { idx, idx2, distance });
         });
-        // Output is already grouped by idx with non-decreasing distance from the
-        // merge; this sort only reorders within (idx, distance) buckets.
-        radsort::sort_by_key(&mut results, |n| (n.idx, n.distance, n.idx2));
+        // The merge already emits in idx-ascending order with non-decreasing
+        // distance inside each idx bucket; only idx2 can be out of order inside
+        // a (idx, distance) bucket. That's near-fully-sorted input, which
+        // pdqsort handles in close to O(n) thanks to its pattern detection —
+        // typically faster than a 3-pass LSD radix sort over 16-byte structs
+        // here. Unstable is fine: full tuple key disambiguates every element.
+        results.sort_unstable_by_key(|n| (n.idx, n.distance, n.idx2));
         let mut out_idxs = Vec::with_capacity(results.len());
         let mut out_idxs2 = Vec::with_capacity(results.len());
         let mut out_distances = Vec::with_capacity(results.len());

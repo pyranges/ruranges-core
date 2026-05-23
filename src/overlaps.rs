@@ -16,6 +16,7 @@ fn sorted_records<C: GroupType, T: PositionType>(
     groups: &[C],
     starts: &[T],
     ends: &[T],
+    overlap_type: OverlapType,
 ) -> Vec<IntervalRecord<C, T>> {
     debug_assert_eq!(groups.len(), starts.len(), "groups/starts length mismatch");
     debug_assert_eq!(groups.len(), ends.len(), "groups/ends length mismatch");
@@ -31,7 +32,27 @@ fn sorted_records<C: GroupType, T: PositionType>(
         });
     }
 
-    sort_by_key(&mut records, |r| (r.group, r.start, r.end, r.idx));
+    // Sort key choice depends on overlap_type:
+    //
+    // - `All`: every overlapping pair is emitted, so sweep order does not affect
+    //   *which* pairs come out; downstream `overlaps()` then sorts pairs by
+    //   `(idx, idx2)` when `sort_output=true`, fully determining the final
+    //   ordering. Sorting by `(group, start)` is therefore sufficient and saves
+    //   two radsort passes over fat 32-byte records.
+    //
+    // - `First` / `Last`: the sweep walks the active list in order and emits
+    //   only the first/last match, so the in-sweep ordering of records with the
+    //   same `(group, start)` decides which target is returned. We need a
+    //   tie-breaker that's stable across runs/platforms — including `end` and
+    //   `idx` ensures determinism. This was load-bearing for
+    //   pyranges/ruranges_py#23 (sort_order=True returning right-side indices
+    //   in scrambled order); do not drop those fields here.
+    match overlap_type {
+        OverlapType::All => sort_by_key(&mut records, |r| (r.group, r.start)),
+        OverlapType::First | OverlapType::Last => {
+            sort_by_key(&mut records, |r| (r.group, r.start, r.end, r.idx))
+        }
+    }
 
     records
 }
@@ -76,8 +97,8 @@ fn collect_overlap_pairs<C: GroupType, T: PositionType>(
     overlap_type: OverlapType,
     contained: bool,
 ) -> Vec<OverlapPair> {
-    let left = sorted_records(chrs, starts, ends);
-    let right = sorted_records(chrs2, starts2, ends2);
+    let left = sorted_records(chrs, starts, ends, overlap_type);
+    let right = sorted_records(chrs2, starts2, ends2, overlap_type);
 
     let n1 = left.len();
     let n2 = right.len();
@@ -367,8 +388,10 @@ pub fn count_overlaps<C: GroupType, T: PositionType>(
     ends2: &[T],
     slack: T,
 ) -> Vec<u32> {
-    let left = sorted_records(chrs, starts, ends);
-    let right = sorted_records(chrs2, starts2, ends2);
+    // count_overlaps only returns a count per left interval, so it never cares
+    // which target was matched. Use the minimal `All` sort key.
+    let left = sorted_records(chrs, starts, ends, OverlapType::All);
+    let right = sorted_records(chrs2, starts2, ends2, OverlapType::All);
 
     let n1 = left.len();
     let n2 = right.len();
