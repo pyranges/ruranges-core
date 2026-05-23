@@ -1,18 +1,37 @@
 use std::str::FromStr;
 
 use crate::{
-    overlaps::overlaps,
-    ruranges_structs::{GroupType, MinEvent, Nearest, OverlapPair, PositionType},
+    overlaps::{collect_overlap_pairs_from_sorted, sorted_records, IntervalRecord},
+    ruranges_structs::{GroupType, MinEvent, Nearest, OverlapPair, OverlapType, PositionType},
     sorts::build_sorted_events_single_collection_separate_outputs,
 };
+
+/// Convert pre-sorted IntervalRecord slice into MinEvent vec using the
+/// `start` field (optionally shifted by `slack`). Both sort keys —
+/// `(group, start)` and `(chr, start - slack)` — order elements
+/// identically, so we get a sorted MinEvent vec for free, no radsort
+/// passes needed.
+fn min_events_from_sorted_starts<C: GroupType, T: PositionType>(
+    records: &[IntervalRecord<C, T>],
+    slack: T,
+) -> Vec<MinEvent<C, T>> {
+    records
+        .iter()
+        .map(|r| MinEvent {
+            chr: r.group,
+            pos: r.start - slack,
+            idx: r.idx,
+        })
+        .collect()
+}
 
 /// For each MinEvent in `sorted_ends`, find up to `k` *unique positions*
 /// in `sorted_starts2` that lie to the right (including equal position on the
 /// same chromosome). If multiple entries in `sorted_starts2` share the same
 /// position, they all get reported, but they count as one unique position.
 pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
-    sorted_ends: Vec<MinEvent<C, T>>,
-    sorted_starts2: Vec<MinEvent<C, T>>,
+    sorted_ends: &[MinEvent<C, T>],
+    sorted_starts2: &[MinEvent<C, T>],
     k: usize,
 ) -> Vec<Nearest<T>> {
     // We might need more than `sorted_ends.len()` because each end could
@@ -28,7 +47,7 @@ pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
     let mut j = 0usize;
 
     // Iterate over each 'end' event
-    for end in &sorted_ends {
+    for end in sorted_ends {
         let end_chr = end.chr;
         let end_pos = end.pos;
 
@@ -99,8 +118,8 @@ pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
 /// the same position, they all get reported, but they count as one
 /// unique position in the limit `k`.
 pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
-    sorted_ends: Vec<MinEvent<C, T>>,
-    sorted_starts2: Vec<MinEvent<C, T>>,
+    sorted_ends: &[MinEvent<C, T>],
+    sorted_starts2: &[MinEvent<C, T>],
     k: usize,
 ) -> Vec<Nearest<T>> {
     // The max possible size is (number of ends) * (k + duplicates at each of those k positions).
@@ -110,7 +129,7 @@ pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
     let n_starts = sorted_starts2.len();
     let mut j = 0_usize; // Points into sorted_starts2
 
-    for end in &sorted_ends {
+    for end in sorted_ends {
         let end_chr = end.chr;
         let end_pos = end.pos;
 
@@ -225,15 +244,85 @@ where
     let need_left = dir == Direction::Backward || dir == Direction::Any;
     let need_right = dir == Direction::Forward || dir == Direction::Any;
 
+    // Which sorts are needed by which producer:
+    //
+    //   producer            left order       right order
+    //   ------------------  ---------------  ---------------
+    //   overlap             (group, start)   (group, start)
+    //   nearest_left        (group, start)   (group, end)
+    //   nearest_right       (group, end)     (group, start)
+    //
+    // The `(group, start)` ordering shows up in both overlap+nearest_left
+    // (for left) and overlap+nearest_right (for right). We build each
+    // shared `IntervalRecord` view at most once and convert it into the
+    // `MinEvent` shape that the nearest sweeps want via a cheap O(n) walk
+    // (no extra radsort passes, since subtracting a constant `slack`
+    // preserves the sort order). The end-based sorts are unique per
+    // producer and have to be built independently.
+    let want_left_records = include_overlaps || need_left;
+    let want_right_records = include_overlaps || need_right;
+
+    // Phase 1: build all sorted views in parallel. The four leaves can run
+    // on up to four worker threads.
+    let ((left_records, right_records), (left_by_end, right_by_end)) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    if want_left_records {
+                        Some(sorted_records(chrs, starts, ends, OverlapType::All))
+                    } else {
+                        None
+                    }
+                },
+                || {
+                    if want_right_records {
+                        Some(sorted_records(chrs2, starts2, ends2, OverlapType::All))
+                    } else {
+                        None
+                    }
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    if need_right {
+                        Some(build_sorted_events_single_collection_separate_outputs(
+                            chrs, ends, slack,
+                        ))
+                    } else {
+                        None
+                    }
+                },
+                || {
+                    if need_left {
+                        Some(build_sorted_events_single_collection_separate_outputs(
+                            chrs2, ends2, T::zero(),
+                        ))
+                    } else {
+                        None
+                    }
+                },
+            )
+        },
+    );
+
+    // Phase 2: run the three sweeps in parallel, each reading from the
+    // shared views.
     let compute_overlaps = || -> Vec<OverlapPair> {
         if include_overlaps {
-            let (idx, idx2) = overlaps(
-                chrs, starts, ends, chrs2, starts2, ends2, slack, "all", true, false,
-            );
-            idx.into_iter()
-                .zip(idx2)
-                .map(|(idx, idx2)| OverlapPair { idx, idx2 })
-                .collect()
+            let l = left_records
+                .as_ref()
+                .expect("want_left_records implied by include_overlaps");
+            let r = right_records
+                .as_ref()
+                .expect("want_right_records implied by include_overlaps");
+            // Reproduce `overlaps(... "all", sort_output=true, false)` but
+            // skip the redundant sort_records calls inside.
+            let mut pairs =
+                collect_overlap_pairs_from_sorted(l, r, slack, OverlapType::All, false);
+            radsort::sort_by_key(&mut pairs, |p| (p.idx, p.idx2));
+            pairs
         } else {
             Vec::new()
         }
@@ -241,15 +330,21 @@ where
 
     let compute_left = || -> Vec<Nearest<T>> {
         if need_left {
-            let (sorted_starts, sorted_ends2) = rayon::join(
-                || build_sorted_events_single_collection_separate_outputs(chrs, starts, slack),
-                || build_sorted_events_single_collection_separate_outputs(chrs2, ends2, T::zero()),
-            );
-            let mut tmp = nearest_intervals_to_the_left(sorted_starts, sorted_ends2, k);
-            // Each `idx` is unique per row and produces one contiguous block whose
-            // distances are already non-decreasing (descending local_idx, growing
-            // `end_pos - start.pos + 1`). radsort is a stable LSD radix sort, so
-            // sorting by `n.idx` alone preserves the within-block distance order.
+            let l = left_records
+                .as_ref()
+                .expect("want_left_records implied by need_left");
+            // Convert pre-sorted left records to MinEvent with pos = start - slack.
+            // Sort order is preserved (subtracting a constant doesn't reorder).
+            let sorted_starts = min_events_from_sorted_starts(l, slack);
+            let sorted_ends2 = right_by_end
+                .as_ref()
+                .expect("right_by_end set when need_left is true");
+            let mut tmp = nearest_intervals_to_the_left(&sorted_starts, sorted_ends2, k);
+            // Each `idx` is unique per row and produces one contiguous block
+            // whose distances are already non-decreasing (descending local_idx,
+            // growing `end_pos - start.pos + 1`). radsort is a stable LSD radix
+            // sort, so sorting by `n.idx` alone preserves the within-block
+            // distance order.
             radsort::sort_by_key(&mut tmp, |n| n.idx);
             tmp
         } else {
@@ -259,11 +354,15 @@ where
 
     let compute_right = || -> Vec<Nearest<T>> {
         if need_right {
-            let (sorted_ends, sorted_starts2) = rayon::join(
-                || build_sorted_events_single_collection_separate_outputs(chrs, ends, slack),
-                || build_sorted_events_single_collection_separate_outputs(chrs2, starts2, T::zero()),
-            );
-            let mut tmp = nearest_intervals_to_the_right(sorted_ends, sorted_starts2, k);
+            let r = right_records
+                .as_ref()
+                .expect("want_right_records implied by need_right");
+            // Right side: pos = start - 0, just reuse the shared records.
+            let sorted_starts2 = min_events_from_sorted_starts(r, T::zero());
+            let sorted_ends = left_by_end
+                .as_ref()
+                .expect("left_by_end set when need_right is true");
+            let mut tmp = nearest_intervals_to_the_right(sorted_ends, &sorted_starts2, k);
             // See comment above — stable sort by `n.idx` is sufficient.
             radsort::sort_by_key(&mut tmp, |n| n.idx);
             tmp

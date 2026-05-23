@@ -5,14 +5,14 @@ use radsort::sort_by_key;
 use crate::ruranges_structs::{GroupType, OverlapPair, OverlapType, PositionType};
 
 #[derive(Copy, Clone, Debug)]
-struct IntervalRecord<C: GroupType, T: PositionType> {
-    group: C,
-    start: T,
-    end: T,
-    idx: u32,
+pub(crate) struct IntervalRecord<C: GroupType, T: PositionType> {
+    pub(crate) group: C,
+    pub(crate) start: T,
+    pub(crate) end: T,
+    pub(crate) idx: u32,
 }
 
-fn sorted_records<C: GroupType, T: PositionType>(
+pub(crate) fn sorted_records<C: GroupType, T: PositionType>(
     groups: &[C],
     starts: &[T],
     ends: &[T],
@@ -99,7 +99,18 @@ fn collect_overlap_pairs<C: GroupType, T: PositionType>(
 ) -> Vec<OverlapPair> {
     let left = sorted_records(chrs, starts, ends, overlap_type);
     let right = sorted_records(chrs2, starts2, ends2, overlap_type);
+    collect_overlap_pairs_from_sorted(&left, &right, slack, overlap_type, contained)
+}
 
+/// Run the overlap sweep against pre-sorted left/right records. Used when
+/// callers (e.g. `nearest`) need to share the sorted views with other sweeps.
+pub(crate) fn collect_overlap_pairs_from_sorted<C: GroupType, T: PositionType>(
+    left: &[IntervalRecord<C, T>],
+    right: &[IntervalRecord<C, T>],
+    slack: T,
+    overlap_type: OverlapType,
+    contained: bool,
+) -> Vec<OverlapPair> {
     let n1 = left.len();
     let n2 = right.len();
 
