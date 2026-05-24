@@ -58,7 +58,7 @@ pub(crate) fn sorted_records<C: GroupType, T: PositionType>(
 }
 
 #[inline(always)]
-fn overlaps_with_slack<T: PositionType>(
+pub(crate) fn overlaps_with_slack<T: PositionType>(
     query_start: T,
     query_end: T,
     target_start: T,
@@ -69,7 +69,7 @@ fn overlaps_with_slack<T: PositionType>(
 }
 
 #[inline(always)]
-fn query_contained_in_target_with_slack<T: PositionType>(
+pub(crate) fn query_contained_in_target_with_slack<T: PositionType>(
     query_start: T,
     query_end: T,
     target_start: T,
@@ -81,7 +81,7 @@ fn query_contained_in_target_with_slack<T: PositionType>(
     query_start_slack >= target_start && query_end_slack <= target_end
 }
 
-fn clear_active(active: &mut Vec<usize>, active_head: &mut usize) {
+pub(crate) fn clear_active(active: &mut Vec<usize>, active_head: &mut usize) {
     active.clear();
     *active_head = 0;
 }

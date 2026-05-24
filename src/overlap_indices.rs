@@ -1,65 +1,9 @@
 use std::str::FromStr;
 
+use crate::overlaps::{
+    clear_active, overlaps_with_slack, query_contained_in_target_with_slack, sorted_records,
+};
 use crate::ruranges_structs::{GroupType, OverlapType, PositionType};
-
-#[derive(Copy, Clone, Debug)]
-struct IntervalRecord<C: GroupType, T: PositionType> {
-    group: C,
-    start: T,
-    end: T,
-    idx: u32,
-}
-
-fn sorted_records<C: GroupType, T: PositionType>(
-    groups: &[C],
-    starts: &[T],
-    ends: &[T],
-) -> Vec<IntervalRecord<C, T>> {
-    debug_assert_eq!(groups.len(), starts.len(), "groups/starts length mismatch");
-    debug_assert_eq!(groups.len(), ends.len(), "groups/ends length mismatch");
-
-    let mut records = Vec::with_capacity(groups.len());
-    for idx in 0..groups.len() {
-        records.push(IntervalRecord {
-            group: groups[idx],
-            start: starts[idx],
-            end: ends[idx],
-            idx: idx as u32,
-        });
-    }
-
-    radsort::sort_by_key(&mut records, |r| (r.group, r.start, r.end, r.idx));
-    records
-}
-
-#[inline(always)]
-fn overlaps_with_slack<T: PositionType>(
-    query_start: T,
-    query_end: T,
-    target_start: T,
-    target_end: T,
-    slack: T,
-) -> bool {
-    query_start < target_end.saturating_add(slack) && target_start < query_end.saturating_add(slack)
-}
-
-#[inline(always)]
-fn query_contained_in_target_with_slack<T: PositionType>(
-    query_start: T,
-    query_end: T,
-    target_start: T,
-    target_end: T,
-    slack: T,
-) -> bool {
-    let query_start_slack = query_start.saturating_sub(slack);
-    let query_end_slack = query_end.saturating_add(slack);
-    query_start_slack >= target_start && query_end_slack <= target_end
-}
-
-fn clear_active(active: &mut Vec<usize>, active_head: &mut usize) {
-    active.clear();
-    *active_head = 0;
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn overlap_indices<C: GroupType, T: PositionType>(
@@ -76,8 +20,12 @@ pub fn overlap_indices<C: GroupType, T: PositionType>(
 ) -> Vec<u32> {
     let overlap_type = OverlapType::from_str(overlap_type).expect("invalid overlap_type string");
     let keep_all_matches = matches!(overlap_type, OverlapType::All);
-    let left = sorted_records(chrs, starts, ends);
-    let right = sorted_records(chrs2, starts2, ends2);
+    // `sorted_records` picks a narrower (group, start) sort key for `All`
+    // (output is sorted afterwards anyway), and the full
+    // (group, start, end, idx) key for First/Last to keep the issue #23
+    // tie-breaking behavior.
+    let left = sorted_records(chrs, starts, ends, overlap_type);
+    let right = sorted_records(chrs2, starts2, ends2, overlap_type);
 
     let n1 = left.len();
     let n2 = right.len();
