@@ -86,19 +86,10 @@ pub fn overlap_indices<C: GroupType, T: PositionType>(
                     jr += 1;
                 }
 
-                while active_head < active.len() {
-                    let r = active[active_head];
-                    if right[r].end <= query_start_slack {
-                        active_head += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if active_head > 0 && active_head * 2 >= active.len() {
-                    active.drain(0..active_head);
-                    active_head = 0;
-                }
+                // See `collect_overlap_pairs_from_sorted`: negative slack may
+                // make a pair contained even when the target ends at the
+                // effective query start. Keep candidates admitted by their
+                // start and evaluate the pair predicate below.
 
                 for idx in active_head..active.len() {
                     let target = right[active[idx]];
@@ -227,6 +218,48 @@ mod tests {
         );
 
         assert_eq!(left_only, left);
+    }
+
+    #[test]
+    fn overlap_indices_contained_negative_slack_is_independent_of_other_targets() {
+        let groups: [Group; 1] = [0];
+        let starts: [Pos; 1] = [10];
+        let ends: [Pos; 1] = [12];
+
+        let target_groups: [Group; 1] = [0];
+        let target_starts: [Pos; 1] = [10];
+        let target_ends: [Pos; 1] = [12];
+        let alone = overlap_indices(
+            &groups,
+            &starts,
+            &ends,
+            &target_groups,
+            &target_starts,
+            &target_ends,
+            -2,
+            "all",
+            true,
+            true,
+        );
+
+        let targets_groups: [Group; 2] = [0, 0];
+        let targets_starts: [Pos; 2] = [0, 10];
+        let targets_ends: [Pos; 2] = [100, 12];
+        let with_other = overlap_indices(
+            &groups,
+            &starts,
+            &ends,
+            &targets_groups,
+            &targets_starts,
+            &targets_ends,
+            -2,
+            "all",
+            true,
+            true,
+        );
+
+        assert_eq!(alone, vec![0]);
+        assert_eq!(with_other, vec![0, 0]);
     }
 
     #[test]
