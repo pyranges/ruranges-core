@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "ruranges-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "num-traits",
  "radsort",
