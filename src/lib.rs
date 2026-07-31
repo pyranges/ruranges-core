@@ -12,6 +12,7 @@ pub mod nearest;
 pub mod outside_bounds;
 pub mod overlap_indices;
 pub mod overlaps;
+pub mod ranks;
 pub mod ruranges_structs;
 pub mod sorts;
 pub mod spliced_subsequence;
