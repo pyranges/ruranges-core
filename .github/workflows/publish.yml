@@ -1,8 +1,6 @@
 name: Publish to Crates.io
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
 
 jobs:
   publish:
