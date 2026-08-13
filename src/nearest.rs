@@ -25,14 +25,48 @@ fn min_events_from_sorted_starts<C: GroupType, T: PositionType>(
         .collect()
 }
 
+/// Whether a query reports every neighbour at a winning distance or only one
+/// of them.
+///
+/// Every neighbour a query overlaps sits at distance 0, so under
+/// [`Ties::All`] "the nearest neighbours" of a query inside a dense region is
+/// every interval covering it. [`Ties::First`] reports one row per query per
+/// distance instead, which is what `bedtools closest -t first`,
+/// `GenomicRanges` `select="arbitrary"` and BEDOPS `--closest` do.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Ties {
+    /// Report every neighbour at each reported distance. The default, and
+    /// what [`nearest`] has always done.
+    #[default]
+    All,
+    /// Report a single neighbour per reported distance. *Which* one is not
+    /// specified — only that it is at the winning distance, and that the same
+    /// input gives the same answer every time.
+    First,
+}
+
+impl FromStr for Ties {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "all" => Ok(Ties::All),
+            "first" => Ok(Ties::First),
+            _ => Err("Invalid ties string"),
+        }
+    }
+}
+
 /// For each MinEvent in `sorted_ends`, find up to `k` *unique positions*
 /// in `sorted_starts2` that lie to the right (including equal position on the
-/// same chromosome). If multiple entries in `sorted_starts2` share the same
-/// position, they all get reported, but they count as one unique position.
+/// same chromosome). Entries sharing a position share a distance, so under
+/// [`Ties::All`] they are all reported and count as one unique position, while
+/// under [`Ties::First`] only the first of each position is reported.
 pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
     sorted_ends: &[MinEvent<C, T>],
     sorted_starts2: &[MinEvent<C, T>],
     k: usize,
+    ties: Ties,
 ) -> Vec<Nearest<T>> {
     // We might need more than `sorted_ends.len()` because each end could
     // contribute up to `k` *unique positions* (potentially multiplied by the
@@ -88,7 +122,8 @@ pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
             }
 
             // Check if we're at a new unique position
-            if last_pos.map_or(true, |lp| start.pos != lp) {
+            let is_new_position = last_pos.map_or(true, |lp| start.pos != lp);
+            if is_new_position {
                 unique_count += 1;
                 if unique_count > k {
                     // we've reached the limit of k unique positions
@@ -97,13 +132,16 @@ pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
                 last_pos = Some(start.pos);
             }
 
-            // This start is included in the results
-            let distance = start.pos - end_pos + T::one(); // can be 0 or positive
-            output.push(Nearest {
-                distance,
-                idx: end.idx,
-                idx2: start.idx,
-            });
+            // A repeated position is a repeated distance, so under `First` the
+            // bucket already has its one row.
+            if is_new_position || ties == Ties::All {
+                let distance = start.pos - end_pos + T::one(); // can be 0 or positive
+                output.push(Nearest {
+                    distance,
+                    idx: end.idx,
+                    idx2: start.idx,
+                });
+            }
 
             local_idx += 1;
         }
@@ -114,13 +152,15 @@ pub fn nearest_intervals_to_the_right<C: GroupType, T: PositionType>(
 
 /// For each MinEvent in `sorted_ends`, find up to `k` *unique positions*
 /// in `sorted_starts2` that lie to the left (strictly smaller position on
-/// the same chromosome). If multiple entries in `sorted_starts2` share
-/// the same position, they all get reported, but they count as one
-/// unique position in the limit `k`.
+/// the same chromosome). Entries sharing a position share a distance, so
+/// under [`Ties::All`] they are all reported and count as one unique position
+/// in the limit `k`, while under [`Ties::First`] only the first of each
+/// position is reported.
 pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
     sorted_ends: &[MinEvent<C, T>],
     sorted_starts2: &[MinEvent<C, T>],
     k: usize,
+    ties: Ties,
 ) -> Vec<Nearest<T>> {
     // The max possible size is (number of ends) * (k + duplicates at each of those k positions).
     // We reserve a rough upper bound for efficiency.
@@ -174,7 +214,8 @@ pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
             }
 
             // Check if we have a new (unique) position
-            if last_pos.map_or(true, |lp| start.pos != lp) {
+            let is_new_position = last_pos.map_or(true, |lp| start.pos != lp);
+            if is_new_position {
                 unique_count += 1;
                 if unique_count > k {
                     break;
@@ -182,14 +223,18 @@ pub fn nearest_intervals_to_the_left<C: GroupType, T: PositionType>(
                 last_pos = Some(start.pos);
             }
 
-            // Calculate the distance (end.pos - start.pos)
-            // Here, start.pos < end.pos by definition if we get here.
-            let distance = end_pos - start.pos + T::one();
-            output.push(Nearest {
-                distance,
-                idx: end.idx,    // the 'end' event's idx
-                idx2: start.idx, // the 'start' event's idx
-            });
+            // A repeated position is a repeated distance, so under `First` the
+            // bucket already has its one row.
+            if is_new_position || ties == Ties::All {
+                // Calculate the distance (end.pos - start.pos)
+                // Here, start.pos < end.pos by definition if we get here.
+                let distance = end_pos - start.pos + T::one();
+                output.push(Nearest {
+                    distance,
+                    idx: end.idx,    // the 'end' event's idx
+                    idx2: start.idx, // the 'start' event's idx
+                });
+            }
 
             if local_idx == 0 {
                 break;
@@ -222,6 +267,11 @@ impl FromStr for Direction {
     }
 }
 
+/// Report the `k` nearest distances of `chrs2/starts2/ends2` for every row of
+/// `chrs/starts/ends`, with every neighbour at each of those distances.
+///
+/// Use [`nearest_with_ties`] to report one neighbour per distance instead.
+#[allow(clippy::too_many_arguments)]
 pub fn nearest<C: GroupType, T: PositionType>(
     chrs: &[C],
     starts: &[T],
@@ -234,6 +284,47 @@ pub fn nearest<C: GroupType, T: PositionType>(
     include_overlaps: bool,
     direction: &str,
     sort_output: bool,
+) -> (Vec<u32>, Vec<u32>, Vec<T>)
+where
+    C: Send + Sync,
+    T: Send + Sync,
+{
+    nearest_with_ties(
+        chrs,
+        starts,
+        ends,
+        chrs2,
+        starts2,
+        ends2,
+        slack,
+        k,
+        include_overlaps,
+        direction,
+        sort_output,
+        Ties::All,
+    )
+}
+
+/// [`nearest`], with control over how many neighbours a tied distance reports.
+///
+/// `Ties::First` is not a filter over the `Ties::All` result: the tied rows are
+/// never produced. Under `include_overlaps` a query inside a dense region
+/// overlaps — and so ties with — every interval covering it, and materialising
+/// those before dropping them costs the same memory as keeping them.
+#[allow(clippy::too_many_arguments)]
+pub fn nearest_with_ties<C: GroupType, T: PositionType>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    chrs2: &[C],
+    starts2: &[T],
+    ends2: &[T],
+    slack: T,
+    k: usize,
+    include_overlaps: bool,
+    direction: &str,
+    sort_output: bool,
+    ties: Ties,
 ) -> (Vec<u32>, Vec<u32>, Vec<T>)
 where
     C: Send + Sync,
@@ -317,10 +408,27 @@ where
             let r = right_records
                 .as_ref()
                 .expect("want_right_records implied by include_overlaps");
-            // Reproduce `overlaps(... "all", sort_output=true, false)` but
+            // Every overlap of a query is at distance 0, so they are one
+            // bucket, and under `First` the sweep must stop at the first of
+            // them rather than hand the merge a bucket to throw away. That is
+            // exactly `OverlapType::First`.
+            //
+            // The records were sorted with the `All` key, `(group, start)`.
+            // `sorted_records` documents the richer `First` key as what makes
+            // *which* target the sweep returns reproducible; radsort is stable
+            // and the records are built in `idx` order, so equal
+            // `(group, start)` targets still reach the active list in `idx`
+            // order and the pick is reproducible here too. Nearest does not
+            // promise which tied neighbour it returns anyway, and the two
+            // extra radsort passes over 32-byte records would be paid on
+            // exactly the large inputs this option exists for.
+            let overlap_type = match ties {
+                Ties::All => OverlapType::All,
+                Ties::First => OverlapType::First,
+            };
+            // Reproduce `overlaps(... sort_output=true, false)` but
             // skip the redundant sort_records calls inside.
-            let mut pairs =
-                collect_overlap_pairs_from_sorted(l, r, slack, OverlapType::All, false);
+            let mut pairs = collect_overlap_pairs_from_sorted(l, r, slack, overlap_type, false);
             radsort::sort_by_key(&mut pairs, |p| (p.idx, p.idx2));
             pairs
         } else {
@@ -339,7 +447,7 @@ where
             let sorted_ends2 = right_by_end
                 .as_ref()
                 .expect("right_by_end set when need_left is true");
-            let mut tmp = nearest_intervals_to_the_left(&sorted_starts, sorted_ends2, k);
+            let mut tmp = nearest_intervals_to_the_left(&sorted_starts, sorted_ends2, k, ties);
             // Each `idx` is unique per row and produces one contiguous block
             // whose distances are already non-decreasing (descending local_idx,
             // growing `end_pos - start.pos + 1`). radsort is a stable LSD radix
@@ -362,7 +470,7 @@ where
             let sorted_ends = left_by_end
                 .as_ref()
                 .expect("left_by_end set when need_right is true");
-            let mut tmp = nearest_intervals_to_the_right(sorted_ends, &sorted_starts2, k);
+            let mut tmp = nearest_intervals_to_the_right(sorted_ends, &sorted_starts2, k, ties);
             // See comment above — stable sort by `n.idx` is sufficient.
             radsort::sort_by_key(&mut tmp, |n| n.idx);
             tmp
@@ -377,21 +485,31 @@ where
     let ((overlaps, nearest_left), nearest_right) =
         rayon::join(|| rayon::join(compute_overlaps, compute_left), compute_right);
 
-    merge_three_way_by_index_distance(&overlaps, &nearest_left, &nearest_right, k, sort_output)
+    merge_three_way_by_index_distance(
+        &overlaps,
+        &nearest_left,
+        &nearest_right,
+        k,
+        ties,
+        sort_output,
+    )
 }
 
 /// Merges three sources of intervals, grouped by `idx`.
-/// For each unique `idx`, returns up to `k` *distinct* distances (including all
-/// intervals at those distances). Overlaps are treated as distance=0 and form a
-/// single bucket per idx.
+/// For each unique `idx`, returns up to `k` *distinct* distances — with every
+/// interval at those distances under [`Ties::All`], and one interval per
+/// distance under [`Ties::First`]. Overlaps are treated as distance=0 and form
+/// a single bucket per idx.
 ///
 /// All inputs are sorted by `idx` ascending; within each idx group, distances
 /// in `nearest_left` and `nearest_right` are non-decreasing.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_three_way_by_index_distance<T: PositionType>(
     overlaps: &[OverlapPair],
     nearest_left: &[Nearest<T>],
     nearest_right: &[Nearest<T>],
     k: usize,
+    ties: Ties,
     sort_output: bool,
 ) -> (Vec<u32>, Vec<u32>, Vec<T>) {
     // Cap pre-allocation: at most one entry emitted per input row across all
@@ -402,9 +520,20 @@ pub fn merge_three_way_by_index_distance<T: PositionType>(
         // On the sort path, collect into a single Vec<Nearest> so we can sort
         // by (idx, distance, idx2) to match the prior output ordering exactly.
         let mut results: Vec<Nearest<T>> = Vec::with_capacity(cap);
-        merge_inner(overlaps, nearest_left, nearest_right, k, |idx, idx2, distance| {
-            results.push(Nearest { idx, idx2, distance });
-        });
+        merge_inner(
+            overlaps,
+            nearest_left,
+            nearest_right,
+            k,
+            ties,
+            |idx, idx2, distance| {
+                results.push(Nearest {
+                    idx,
+                    idx2,
+                    distance,
+                });
+            },
+        );
         // The merge already emits in idx-ascending order with non-decreasing
         // distance inside each idx bucket; only idx2 can be out of order inside
         // a (idx, distance) bucket. That's near-fully-sorted input, which
@@ -426,11 +555,18 @@ pub fn merge_three_way_by_index_distance<T: PositionType>(
     let mut out_idxs: Vec<u32> = Vec::with_capacity(cap);
     let mut out_idxs2: Vec<u32> = Vec::with_capacity(cap);
     let mut out_distances: Vec<T> = Vec::with_capacity(cap);
-    merge_inner(overlaps, nearest_left, nearest_right, k, |idx, idx2, distance| {
-        out_idxs.push(idx);
-        out_idxs2.push(idx2);
-        out_distances.push(distance);
-    });
+    merge_inner(
+        overlaps,
+        nearest_left,
+        nearest_right,
+        k,
+        ties,
+        |idx, idx2, distance| {
+            out_idxs.push(idx);
+            out_idxs2.push(idx2);
+            out_distances.push(distance);
+        },
+    );
     (out_idxs, out_idxs2, out_distances)
 }
 
@@ -444,6 +580,7 @@ fn merge_inner<T: PositionType, F: FnMut(u32, u32, T)>(
     nearest_left: &[Nearest<T>],
     nearest_right: &[Nearest<T>],
     k: usize,
+    ties: Ties,
     mut emit: F,
 ) {
     let (mut i, mut j, mut r) = (0_usize, 0_usize, 0_usize);
@@ -487,8 +624,16 @@ fn merge_inner<T: PositionType, F: FnMut(u32, u32, T)>(
         // Overlaps (all distance 0) form one bucket.
         if !overlaps_slice.is_empty() {
             distinct_count = 1;
-            for op in overlaps_slice {
-                emit(op.idx, op.idx2, T::zero());
+            match ties {
+                Ties::All => {
+                    for op in overlaps_slice {
+                        emit(op.idx, op.idx2, T::zero());
+                    }
+                }
+                Ties::First => {
+                    let op = &overlaps_slice[0];
+                    emit(op.idx, op.idx2, T::zero());
+                }
             }
             if distinct_count >= k {
                 continue;
@@ -525,14 +670,30 @@ fn merge_inner<T: PositionType, F: FnMut(u32, u32, T)>(
                 last_dist = Some(smallest);
             }
 
+            if ties == Ties::First {
+                // A query five bases from a neighbour on each side has both in
+                // this bucket. Take the left one; the choice is arbitrary, and
+                // fixing it here is what keeps the answer reproducible.
+                let winner = if left_slice.get(lj).map(|n| n.distance) == Some(smallest) {
+                    left_slice[lj]
+                } else {
+                    right_slice[rr]
+                };
+                emit(winner.idx, winner.idx2, winner.distance);
+            }
+
             while lj < left_slice.len() && left_slice[lj].distance == smallest {
-                let n = left_slice[lj];
-                emit(n.idx, n.idx2, n.distance);
+                if ties == Ties::All {
+                    let n = left_slice[lj];
+                    emit(n.idx, n.idx2, n.distance);
+                }
                 lj += 1;
             }
             while rr < right_slice.len() && right_slice[rr].distance == smallest {
-                let n = right_slice[rr];
-                emit(n.idx, n.idx2, n.distance);
+                if ties == Ties::All {
+                    let n = right_slice[rr];
+                    emit(n.idx, n.idx2, n.distance);
+                }
                 rr += 1;
             }
         }
@@ -541,7 +702,318 @@ fn merge_inner<T: PositionType, F: FnMut(u32, u32, T)>(
 
 #[cfg(test)]
 mod tests {
-    use super::nearest;
+    use std::collections::{HashMap, HashSet};
+
+    use super::{nearest, nearest_with_ties, Ties};
+
+    /// Deterministic intervals, so a failure is reproducible without a
+    /// property-testing dependency.
+    fn pseudo_random_intervals(
+        n: usize,
+        seed: u64,
+        groups: u32,
+        span: i64,
+        max_len: i64,
+    ) -> (Vec<u32>, Vec<i64>, Vec<i64>) {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as i64
+        };
+
+        let mut chrs = Vec::with_capacity(n);
+        let mut starts = Vec::with_capacity(n);
+        let mut ends = Vec::with_capacity(n);
+        for _ in 0..n {
+            let start = next() % span;
+            let len = 1 + next() % max_len;
+            chrs.push((next() % i64::from(groups)) as u32);
+            starts.push(start);
+            ends.push(start + len);
+        }
+        (chrs, starts, ends)
+    }
+
+    /// The one assertion that catches nearly everything: `First` answers
+    /// exactly the same queries as `All`, at the same distance, with exactly
+    /// one row each.
+    #[test]
+    fn nearest_first_answers_the_same_queries_as_all_with_one_row_each() {
+        // Dense enough that most queries overlap several targets, which is the
+        // case the option exists for.
+        let (chrs, starts, ends) = pseudo_random_intervals(500, 11, 3, 4_000, 200);
+        let (chrs2, starts2, ends2) = pseudo_random_intervals(500, 29, 3, 4_000, 200);
+
+        for include_overlaps in [true, false] {
+            for direction in ["any", "forward", "backward"] {
+                let (all_idx, _all_idx2, all_dist) = nearest_with_ties(
+                    &chrs,
+                    &starts,
+                    &ends,
+                    &chrs2,
+                    &starts2,
+                    &ends2,
+                    0,
+                    1,
+                    include_overlaps,
+                    direction,
+                    true,
+                    Ties::All,
+                );
+                let (first_idx, _first_idx2, first_dist) = nearest_with_ties(
+                    &chrs,
+                    &starts,
+                    &ends,
+                    &chrs2,
+                    &starts2,
+                    &ends2,
+                    0,
+                    1,
+                    include_overlaps,
+                    direction,
+                    true,
+                    Ties::First,
+                );
+
+                let case = format!("include_overlaps={include_overlaps}, direction={direction}");
+
+                // k=1 leaves one bucket, so every row of a query shares its
+                // distance and the map is well defined.
+                let winning: HashMap<u32, i64> = all_idx
+                    .iter()
+                    .copied()
+                    .zip(all_dist.iter().copied())
+                    .collect();
+                assert!(
+                    !winning.is_empty(),
+                    "{case}: the fixture answers no queries at all"
+                );
+
+                let answered: HashSet<u32> = first_idx.iter().copied().collect();
+                assert_eq!(
+                    answered.len(),
+                    first_idx.len(),
+                    "{case}: First reported a query more than once"
+                );
+                assert_eq!(
+                    answered,
+                    winning.keys().copied().collect::<HashSet<_>>(),
+                    "{case}: First and All answer different queries"
+                );
+                for (idx, dist) in first_idx.iter().zip(first_dist.iter()) {
+                    assert_eq!(
+                        winning[idx], *dist,
+                        "{case}: query {idx} came back at a losing distance"
+                    );
+                }
+                assert!(
+                    first_idx.len() < all_idx.len(),
+                    "{case}: the fixture has no ties, so it proves nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nearest_first_reports_one_of_the_overlapping_intervals() {
+        // One query covering three targets: three rows at distance 0.
+        let chrs = vec![1_u32];
+        let starts = vec![100_i64];
+        let ends = vec![200_i64];
+
+        let chrs2 = vec![1_u32; 3];
+        let starts2 = vec![90_i64, 120, 150];
+        let ends2 = vec![110_i64, 130, 160];
+
+        let args = (&chrs, &starts, &ends, &chrs2, &starts2, &ends2);
+        let (all_idx, _, all_dist) = nearest_with_ties(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            0,
+            1,
+            true,
+            "any",
+            true,
+            Ties::All,
+        );
+        assert_eq!(all_idx, vec![0, 0, 0]);
+        assert_eq!(all_dist, vec![0, 0, 0]);
+
+        let (first_idx, first_idx2, first_dist) = nearest_with_ties(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            0,
+            1,
+            true,
+            "any",
+            true,
+            Ties::First,
+        );
+        assert_eq!(first_idx, vec![0]);
+        assert_eq!(first_dist, vec![0]);
+        assert_eq!(first_idx2.len(), 1);
+        assert!(first_idx2[0] < 3);
+    }
+
+    #[test]
+    fn nearest_first_breaks_a_two_sided_tie() {
+        // 85-95 and 115-125 are the same distance from 100-110, one on each
+        // side, so the tie is between the two sweeps rather than inside one.
+        let chrs = vec![1_u32];
+        let starts = vec![100_i64];
+        let ends = vec![110_i64];
+
+        let chrs2 = vec![1_u32; 2];
+        let starts2 = vec![85_i64, 115];
+        let ends2 = vec![95_i64, 125];
+
+        let (all_idx, _, all_dist) = nearest_with_ties(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            0,
+            1,
+            true,
+            "any",
+            true,
+            Ties::All,
+        );
+        assert_eq!(all_idx, vec![0, 0]);
+        assert_eq!(all_dist, vec![6, 6]);
+
+        let (first_idx, _, first_dist) = nearest_with_ties(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            0,
+            1,
+            true,
+            "any",
+            true,
+            Ties::First,
+        );
+        assert_eq!(first_idx, vec![0]);
+        assert_eq!(first_dist, vec![6]);
+    }
+
+    #[test]
+    fn nearest_first_prefers_an_overlap_to_a_touching_neighbour() {
+        // 95-105 overlaps 100-110 (distance 0); 110-120 merely touches it
+        // (distance 1). Picking one row must not pick the wrong bucket.
+        let chrs = vec![1_u32];
+        let starts = vec![100_i64];
+        let ends = vec![110_i64];
+
+        let chrs2 = vec![1_u32; 2];
+        let starts2 = vec![95_i64, 110];
+        let ends2 = vec![105_i64, 120];
+
+        let (idx, idx2, dist) = nearest_with_ties(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            0,
+            1,
+            true,
+            "any",
+            true,
+            Ties::First,
+        );
+        assert_eq!(idx, vec![0]);
+        assert_eq!(idx2, vec![0]);
+        assert_eq!(dist, vec![0]);
+    }
+
+    #[test]
+    fn nearest_first_reports_one_row_per_distance_when_k_is_two() {
+        // Two targets tied at each of two distances. k=2 asks for two
+        // distances, so First reports two rows, not four.
+        let chrs = vec![1_u32];
+        let starts = vec![100_i64];
+        let ends = vec![110_i64];
+
+        let chrs2 = vec![1_u32; 4];
+        let starts2 = vec![85_i64, 115, 75, 125];
+        let ends2 = vec![95_i64, 125, 85, 135];
+
+        let (all_idx, _, all_dist) = nearest_with_ties(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            0,
+            2,
+            true,
+            "any",
+            true,
+            Ties::All,
+        );
+        assert_eq!(all_idx.len(), 4);
+        assert_eq!(all_dist, vec![6, 6, 16, 16]);
+
+        let (first_idx, _, first_dist) = nearest_with_ties(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            0,
+            2,
+            true,
+            "any",
+            true,
+            Ties::First,
+        );
+        assert_eq!(first_idx, vec![0, 0]);
+        assert_eq!(first_dist, vec![6, 16]);
+    }
+
+    #[test]
+    fn nearest_defaults_to_reporting_every_tied_interval() {
+        let (chrs, starts, ends) = pseudo_random_intervals(200, 3, 2, 2_000, 150);
+        let (chrs2, starts2, ends2) = pseudo_random_intervals(200, 7, 2, 2_000, 150);
+
+        let bare = nearest(
+            &chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0, 1, true, "any", true,
+        );
+        let explicit = nearest_with_ties(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            0,
+            1,
+            true,
+            "any",
+            true,
+            Ties::All,
+        );
+        assert_eq!(bare, explicit);
+    }
 
     #[test]
     fn nearest_backward_includes_touching_left_interval_with_distance_one() {
