@@ -2,7 +2,7 @@ use radsort::sort;
 
 use crate::{
     ruranges_structs::{GroupType, PositionType},
-    sorts::build_sorted_intervals,
+    sorts::build_sorted_intervals_par,
 };
 
 pub fn max_disjoint<G, T>(
@@ -13,15 +13,15 @@ pub fn max_disjoint<G, T>(
     sort_output: bool,
 ) -> Vec<u32>
 where
-    G: GroupType,
-    T: PositionType,
+    G: GroupType + Send + Sync,
+    T: PositionType + Send + Sync,
 {
     // Ensure the input slices all have the same length.
     assert_eq!(groups.len(), starts.len());
     assert_eq!(starts.len(), ends.len());
 
     // Build and sort intervals (group ➜ start ➜ end).
-    let intervals = build_sorted_intervals(groups, starts, ends, None, slack, true);
+    let intervals = build_sorted_intervals_par(groups, starts, ends, None, slack, true);
 
     if intervals.is_empty() {
         return Vec::new();

@@ -1,5 +1,7 @@
 use radsort::sort_by_key;
+use rayon::prelude::*;
 
+use crate::partition;
 use crate::ruranges_structs::Event;
 use crate::ruranges_structs::GenericEvent;
 use crate::ruranges_structs::GroupStruct;
@@ -128,6 +130,149 @@ pub fn build_sorted_intervals<C: GroupType, T: PositionType>(
     intervals
 }
 
+/// Parallel counterpart of [`build_sorted_intervals`] with **byte-identical**
+/// output, used by the merge and max-disjoint kernels.
+///
+/// A parallel counting partition makes each chromosome a contiguous run, then
+/// each run's coordinate sort runs on its own rayon task — serial radix within a
+/// chromosome, parallel across chromosomes (the same shape as the merge sweep).
+/// radsort is a stable LSD radix, so equal keys keep input/`idx` order, matching
+/// the serial end ➜ start ➜ group passes. Below `PARALLEL_THRESHOLD` it defers
+/// to the serial builder, where the rayon fan-out would not be repaid.
+pub fn build_sorted_intervals_par<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    sort_reverse_direction: Option<&[bool]>,
+    slack: T,
+    sort_on_ends_too: bool,
+) -> Vec<Interval<C, T>> {
+    if chrs.len() < partition::PARALLEL_THRESHOLD {
+        return build_sorted_intervals(
+            chrs,
+            starts,
+            ends,
+            sort_reverse_direction,
+            slack,
+            sort_on_ends_too,
+        );
+    }
+
+    // Nothing to sort when the input is already in target order, which
+    // coordinate-sorted genomic files usually are. Checked on the inputs, in
+    // parallel, and short-circuiting, so it is ~free when they are not. Building
+    // only shifts coordinates by `slack`, which preserves order; a
+    // reverse-direction build negates them, so that case skips the check.
+    let block_list = partition::blocks(chrs.len());
+    if sort_reverse_direction.is_none()
+        && is_input_group_coord_sorted(chrs, starts, ends, &block_list, sort_on_ends_too)
+    {
+        return build_intervals_par(chrs, starts, ends, slack, &block_list);
+    }
+
+    // Make each group contiguous with the parallel counting partition rather
+    // than a serial radix pass over the whole array, then sort each group's
+    // coordinates on its own task. Identical output: the partition is stable, so
+    // within a group the rows keep input order exactly as the stable radix left
+    // them.
+    if sort_reverse_direction.is_none() {
+        if let Some((layout, block_list)) = partition::plan_group_major(chrs, 1) {
+            let runs = layout.group_runs();
+            let mut intervals =
+                partition::scatter_group_major(chrs, &block_list, layout, 1, |row, slots| {
+                    slots[0].write(Interval {
+                        group: chrs[row],
+                        start: starts[row] - slack,
+                        end: ends[row] + slack,
+                        idx: row as u32,
+                    });
+                });
+            sort_groups_by_coordinate(&mut intervals, &runs, sort_on_ends_too);
+            return intervals;
+        }
+    }
+
+    let mut intervals = build_intervals(chrs, starts, ends, sort_reverse_direction, slack);
+    sort_by_key(&mut intervals, |i| i.group);
+    let runs = partition::runs_by(&intervals, |i| i.group);
+    sort_groups_by_coordinate(&mut intervals, &runs, sort_on_ends_too);
+
+    intervals
+}
+
+/// Sort each group's slice by start (and end first, when asked), one task per
+/// batch of groups.
+fn sort_groups_by_coordinate<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    intervals: &mut [Interval<C, T>],
+    runs: &[(usize, usize)],
+    sort_on_ends_too: bool,
+) {
+    partition::par_groups_mut(intervals, runs, |group| {
+        if sort_on_ends_too {
+            sort_by_key(&mut *group, |i| i.end);
+        }
+        sort_by_key(group, |i| i.start);
+    });
+}
+
+/// Build the interval array in input order, in parallel.
+fn build_intervals_par<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    slack: T,
+    block_list: &[(usize, usize)],
+) -> Vec<Interval<C, T>> {
+    let mut intervals: Vec<Interval<C, T>> = Vec::with_capacity(chrs.len());
+    // Split by `block_list` rather than by a fixed chunk width: `partition::blocks`
+    // divides the rows evenly among the blocks, so a block is not `BLOCK_ROWS`
+    // wide and zipping against `par_chunks_mut(BLOCK_ROWS)` would pair each block
+    // with the wrong destination.
+    partition::split_runs_mut(intervals.spare_capacity_mut(), block_list)
+        .into_par_iter()
+        .zip(block_list.par_iter())
+        .for_each(|(target, &(start, end))| {
+            for (slot, row) in target.iter_mut().zip(start..end) {
+                slot.write(Interval {
+                    group: chrs[row],
+                    start: starts[row] - slack,
+                    end: ends[row] + slack,
+                    idx: row as u32,
+                });
+            }
+        });
+    // SAFETY: every slot in 0..len was written above.
+    unsafe { intervals.set_len(chrs.len()) };
+    intervals
+}
+
+/// True when `(group, start[, end])` is already non-decreasing across the inputs.
+fn is_input_group_coord_sorted<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    block_list: &[(usize, usize)],
+    with_ends: bool,
+) -> bool {
+    block_list.par_iter().all(|&(start, end)| {
+        let from = start.saturating_sub(1);
+        for row in from..end.saturating_sub(1) {
+            let next = row + 1;
+            if (chrs[row], starts[row]) > (chrs[next], starts[next]) {
+                return false;
+            }
+            if with_ends
+                && chrs[row] == chrs[next]
+                && starts[row] == starts[next]
+                && ends[row] > ends[next]
+            {
+                return false;
+            }
+        }
+        true
+    })
+}
+
 pub fn build_sorted_subsequence_intervals<G: GroupType, T: PositionType>(
     chrs: &[G],
     starts: &[T],
@@ -238,6 +383,87 @@ pub fn build_sorted_events_single_collection<C: GroupType, T: PositionType>(
     sort_by_key(&mut events, |e| e.is_start);
     sort_by_key(&mut events, |e| e.pos);
     sort_by_key(&mut events, |e| e.chr);
+
+    events
+}
+
+/// Parallel counterpart of [`build_sorted_events_single_collection`] with
+/// **byte-identical** output, used by the single-input sweep kernels (cluster,
+/// split, boundary, complement).
+///
+/// The chr-major counting partition makes each chromosome a contiguous run, then
+/// each run's events are sorted on their own rayon task — serial radix within a
+/// chromosome, parallel across chromosomes. radsort is a stable LSD radix, so
+/// the result matches the serial `is_start → pos → chr` order. Below
+/// `PARALLEL_THRESHOLD` it defers to the serial builder. There is no presorted
+/// fast path: the event array interleaves start and end events, so it is
+/// essentially never already pos-sorted, even when the input intervals are.
+pub fn build_sorted_events_single_collection_par<
+    C: GroupType + Send + Sync,
+    T: PositionType + Send + Sync,
+>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    slack: T,
+) -> Vec<Event<C, T>> {
+    if 2 * chrs.len() < partition::PARALLEL_THRESHOLD {
+        return build_sorted_events_single_collection(chrs, starts, ends, slack);
+    }
+
+    // Both the counting partition and the radix pass it replaces are stable, and
+    // a row's two events stay adjacent and in build order within their
+    // chromosome, so the sorted result is identical either way.
+    let (mut events, runs) = match partition::plan_group_major(chrs, 2) {
+        Some((layout, block_list)) => {
+            let runs = layout.group_runs();
+            let events =
+                partition::scatter_group_major(chrs, &block_list, layout, 2, |row, slots| {
+                    slots[0].write(Event {
+                        chr: chrs[row],
+                        pos: starts[row],
+                        is_start: true,
+                        first_set: true,
+                        idx: row as u32,
+                    });
+                    slots[1].write(Event {
+                        chr: chrs[row],
+                        pos: ends[row] + slack,
+                        is_start: false,
+                        first_set: true,
+                        idx: row as u32,
+                    });
+                });
+            (events, runs)
+        }
+        None => {
+            let mut events = Vec::with_capacity(2 * chrs.len());
+            for i in 0..chrs.len() {
+                events.push(Event {
+                    chr: chrs[i],
+                    pos: starts[i],
+                    is_start: true,
+                    first_set: true,
+                    idx: i as u32,
+                });
+                events.push(Event {
+                    chr: chrs[i],
+                    pos: ends[i] + slack,
+                    is_start: false,
+                    first_set: true,
+                    idx: i as u32,
+                });
+            }
+            sort_by_key(&mut events, |e| e.chr);
+            let runs = partition::runs_by(&events, |e| e.chr);
+            (events, runs)
+        }
+    };
+
+    partition::par_groups_mut(&mut events, &runs, |group| {
+        sort_by_key(&mut *group, |e| e.is_start);
+        sort_by_key(group, |e| e.pos);
+    });
 
     events
 }
@@ -520,4 +746,146 @@ pub fn build_sorted_events_from_intervals<C: GroupType, T: PositionType>(
     sort_by_key(&mut events, |e| e.pos);
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic SplitMix64, so the parity tests need no dev-dependency.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// `n` random intervals over `groups` chromosomes. `sorted` produces the
+    /// coordinate-sorted input the parallel builder has a fast path for.
+    fn random_input(
+        state: &mut u64,
+        n: usize,
+        groups: u32,
+        sorted: bool,
+    ) -> (Vec<u32>, Vec<i64>, Vec<i64>) {
+        let mut chrs = Vec::with_capacity(n);
+        let mut starts = Vec::with_capacity(n);
+        let mut ends = Vec::with_capacity(n);
+        for _ in 0..n {
+            let start = (next(state) % 1_000_000) as i64;
+            chrs.push((next(state) % groups as u64) as u32);
+            starts.push(start);
+            ends.push(start + 1 + (next(state) % 500) as i64);
+        }
+        if sorted {
+            let mut rows: Vec<(u32, i64, i64)> = chrs
+                .iter()
+                .zip(&starts)
+                .zip(&ends)
+                .map(|((&c, &s), &e)| (c, s, e))
+                .collect();
+            rows.sort();
+            for (i, (c, s, e)) in rows.into_iter().enumerate() {
+                chrs[i] = c;
+                starts[i] = s;
+                ends[i] = e;
+            }
+        }
+        (chrs, starts, ends)
+    }
+
+    fn interval_key(iv: &Interval<u32, i64>) -> (u32, i64, i64, u32) {
+        (iv.group, iv.start, iv.end, iv.idx)
+    }
+
+    fn event_key(e: &Event<u32, i64>) -> (u32, i64, bool, bool, u32) {
+        (e.chr, e.pos, e.is_start, e.first_set, e.idx)
+    }
+
+    #[test]
+    fn parallel_interval_builder_matches_serial() {
+        let mut state = 0x1234_5678;
+        // Sizes either side of PARALLEL_THRESHOLD, and both input orders, so the
+        // presorted fast path and the counting partition are both exercised.
+        for &n in &[1_usize, 999, 150_000] {
+            for sorted in [false, true] {
+                for &groups in &[1_u32, 24] {
+                    for ends_too in [false, true] {
+                        let (chrs, starts, ends) = random_input(&mut state, n, groups, sorted);
+                        let serial =
+                            build_sorted_intervals(&chrs, &starts, &ends, None, 0, ends_too);
+                        let parallel =
+                            build_sorted_intervals_par(&chrs, &starts, &ends, None, 0, ends_too);
+                        assert_eq!(
+                            serial.iter().map(interval_key).collect::<Vec<_>>(),
+                            parallel.iter().map(interval_key).collect::<Vec<_>>(),
+                            "n={n} sorted={sorted} groups={groups} ends_too={ends_too}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_interval_builder_matches_serial_with_slack_and_reverse() {
+        let mut state = 0x9999;
+        let (chrs, starts, ends) = random_input(&mut state, 150_000, 8, false);
+        let reverse: Vec<bool> = (0..chrs.len()).map(|i| i % 3 == 0).collect();
+
+        let serial = build_sorted_intervals(&chrs, &starts, &ends, None, 7, false);
+        let parallel = build_sorted_intervals_par(&chrs, &starts, &ends, None, 7, false);
+        assert_eq!(
+            serial.iter().map(interval_key).collect::<Vec<_>>(),
+            parallel.iter().map(interval_key).collect::<Vec<_>>()
+        );
+
+        let serial = build_sorted_intervals(&chrs, &starts, &ends, Some(&reverse), 0, true);
+        let parallel = build_sorted_intervals_par(&chrs, &starts, &ends, Some(&reverse), 0, true);
+        assert_eq!(
+            serial.iter().map(interval_key).collect::<Vec<_>>(),
+            parallel.iter().map(interval_key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parallel_event_builder_matches_serial() {
+        let mut state = 0xABCD;
+        for &n in &[0_usize, 1, 999, 150_000] {
+            for &groups in &[1_u32, 24] {
+                let (chrs, starts, ends) = random_input(&mut state, n, groups, false);
+                let serial = build_sorted_events_single_collection(&chrs, &starts, &ends, 3);
+                let parallel = build_sorted_events_single_collection_par(&chrs, &starts, &ends, 3);
+                assert_eq!(
+                    serial.iter().map(event_key).collect::<Vec<_>>(),
+                    parallel.iter().map(event_key).collect::<Vec<_>>(),
+                    "n={n} groups={groups}"
+                );
+            }
+        }
+    }
+
+    /// Group ids the counting partition declines to index, so the parallel
+    /// builders fall back to the radix path.
+    #[test]
+    fn parallel_builders_match_serial_on_a_span_the_partition_declines() {
+        let mut state = 0x5A5A;
+        let (mut chrs, starts, ends) = random_input(&mut state, 150_000, 4, false);
+        chrs[0] = u32::MAX; // a span far wider than MAX_GROUP_SPAN
+
+        let serial = build_sorted_intervals(&chrs, &starts, &ends, None, 0, true);
+        let parallel = build_sorted_intervals_par(&chrs, &starts, &ends, None, 0, true);
+        assert_eq!(
+            serial.iter().map(interval_key).collect::<Vec<_>>(),
+            parallel.iter().map(interval_key).collect::<Vec<_>>()
+        );
+
+        let serial = build_sorted_events_single_collection(&chrs, &starts, &ends, 0);
+        let parallel = build_sorted_events_single_collection_par(&chrs, &starts, &ends, 0);
+        assert_eq!(
+            serial.iter().map(event_key).collect::<Vec<_>>(),
+            parallel.iter().map(event_key).collect::<Vec<_>>()
+        );
+    }
 }

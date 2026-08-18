@@ -3,14 +3,14 @@ use crate::{
     sorts,
 };
 
-pub fn sweep_line_split<G: GroupType, T: PositionType>(
+pub fn sweep_line_split<G: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     chrs: &[G],
     starts: &[T],
     ends: &[T],
     slack: T,
     between: bool,
 ) -> (Vec<u32>, Vec<T>, Vec<T>) {
-    let events = sorts::build_sorted_events_single_collection(chrs, starts, ends, slack);
+    let events = sorts::build_sorted_events_single_collection_par(chrs, starts, ends, slack);
 
     // These will hold the output arrays: each emitted subinterval’s
     // (original_idx, start, end).

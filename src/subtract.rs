@@ -1,14 +1,30 @@
-use num_traits::{PrimInt, Signed, Zero};
 use radsort::sort_by_key;
-use rustc_hash::FxHashMap;
-use std::hash::Hash;
 
-use crate::{
-    ruranges_structs::{GroupType, Interval, MinEvent, MinInterval, PositionType},
-    sorts,
-};
+use crate::overlaps::{sorted_records_par, GroupRun, IntervalRecord, SortedRecords};
+use crate::partition;
+use crate::ruranges_structs::{GroupType, MinInterval, PositionType};
+use rayon::prelude::*;
 
-pub fn sweep_line_subtract<G: GroupType, T: PositionType>(
+/// Subtract set 2 from set 1, returning the surviving pieces of each set-1
+/// interval as `(idx into set 1, start, end)`.
+///
+/// Subtracting a set is the same as subtracting its union, so this walks each
+/// group's set-2 intervals once into a disjoint cover and then, per set-1
+/// interval, emits the gaps in that cover. Two coordinate sorts over `n1` and
+/// `n2` records, and every group independent of every other.
+///
+/// The previous implementation built `2 * (n1 + n2)` sweep events, radix-sorted
+/// them three times, and tracked live set-1 intervals in an `FxHashMap` that it
+/// scanned in full on every 0↔1 transition of the set-2 depth — so its cost grew
+/// with (set-1 pileup depth × set-2 transitions), which is worst exactly where
+/// the data is densest.
+///
+/// Intervals of non-positive length are ignored on the right (they cover
+/// nothing) and produce no output on the left (nothing survives a subtraction
+/// from an empty span). `polaranges` rejects them before the kernel is reached;
+/// direct callers used to get incoherent results for them, because such an
+/// interval's end event sorted before its own start event.
+pub fn sweep_line_subtract<G: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     chrs1: &[G],
     starts1: &[T],
     ends1: &[T],
@@ -26,134 +42,54 @@ pub fn sweep_line_subtract<G: GroupType, T: PositionType>(
         );
     }
 
-    // Build sorted events
-    let events =
-        sorts::build_sorted_events_idxs(chrs1, starts1, ends1, chrs2, starts2, ends2, T::zero());
+    let left = sorted_records_par(chrs1, starts1, ends1, false);
+    let right = sorted_records_par(chrs2, starts2, ends2, false);
+    let paired = left_runs_with_right(&left, &right);
 
-    let mut out_events = Vec::new();
+    let batches = partition::batch_runs(&paired, partition::BATCH_ROWS, |&(l, r)| {
+        (l.1 - l.0) + r.map_or(0, |run| run.1 - run.0)
+    });
 
-    // Track how many set2 intervals are active
-    let mut active2_count: i64 = 0;
-
-    // For each active interval in set1, store the position at which
-    // we last started a "valid" sub-interval (when active2_count == 0).
-    // i.e. active1[idx] = Some(position) means we are currently capturing
-    // a sub-interval for that idx that started at `position`.
-    let mut active1: FxHashMap<u32, Option<T>> = FxHashMap::default();
-
-    let mut current_chr = events.first().unwrap().chr;
-
-    // We'll sweep in ascending order
-    for e in events.iter() {
-        // If we jumped to a new chromosome, close out everything
-        // because intervals do not cross chromosome boundaries.
-        if e.chr != current_chr {
-            // for any active sub-interval in the old chromosome, we close them at the last event pos
-            // but in typical coordinate intervals, they should already be ended by the end event.
-            // We'll do a final cleanup if you want. Usually, each interval on the old chr
-            // has presumably ended with an event, but if not, you can decide to finalize them here.
-
-            // Clear everything
-            active1.clear();
-            active2_count = 0;
-            current_chr = e.chr;
-        }
-
-        let pos = e.pos;
-
-        // --- 1. If we have *just arrived* at a new position, and `active2_count == 0`,
-        // we are "continuing" sub-intervals for all active1.
-        //
-        // But typically, the actual writing out of intervals
-        // occurs at the event boundaries (start or end).
-        // We'll handle that logic around the transitions.
-
-        // --- 2. Now handle the event itself:
-
-        if e.first_set {
-            // This event is from set1
-            if e.is_start {
-                // A set1 interval starts
-                // If we are outside set2 (active2_count==0),
-                // that means we can immediately start capturing a sub-interval.
-                if active2_count == 0 {
-                    active1.insert(e.idx, Some(pos));
-                } else {
-                    // set2 is active, so we do not start capturing yet
-                    active1.insert(e.idx, None);
-                }
-            } else {
-                // A set1 interval ends
-                // If we have been capturing a sub-interval for this idx, close it
-                if let Some(start_pos) = active1.get(&e.idx).cloned().unwrap_or(None) {
-                    // We are capturing. End the sub-interval at e.pos
-                    if start_pos < pos {
-                        out_events.push(MinInterval {
-                            start: start_pos,
-                            end: pos,
-                            idx: e.idx,
-                        });
-                    }
-                }
-                // Remove it from active1
-                active1.remove(&e.idx);
-            }
-        } else {
-            // This event is from set2
-            if e.is_start {
-                // set2 interval starts
-                active2_count += 1;
-
-                // If we just went from 0 -> 1, that means we need to close
-                // *all currently capturing intervals in set1* right at this boundary.
-                if active2_count == 1 {
-                    // close everyone
-                    for (&idx1, &maybe_start) in active1.iter() {
-                        if let Some(start_pos) = maybe_start {
-                            // Close at current event pos (exclusive or inclusive depends on your semantics)
-                            if start_pos < pos {
-                                out_events.push(MinInterval {
-                                    start: start_pos,
-                                    end: pos,
-                                    idx: idx1,
-                                });
-                            }
-                        }
-                    }
-                    // Now, set them all to None, since we cannot capture while set2 is active
-                    for v in active1.values_mut() {
-                        *v = None;
-                    }
-                }
-            } else {
-                // set2 interval ends
-                active2_count -= 1;
-
-                // If we just went from 1 -> 0, that means we can *resume capturing*
-                // for all set1 intervals that are still active.
-                if active2_count == 0 {
-                    // For every set1 interval that is active, we set the start to the boundary
-                    // so we resume capturing at e.pos
-                    for (_idx1, v) in active1.iter_mut() {
-                        if v.is_none() {
-                            *v = Some(pos);
-                        }
-                    }
+    let collected: Vec<Vec<MinInterval<T>>> = batches
+        .into_par_iter()
+        .map(|batch| {
+            let mut out = Vec::new();
+            // One cover buffer per task, reused across the groups in the batch.
+            let mut cover: Vec<(T, T)> = Vec::new();
+            for &(left_run, right_run) in &paired[batch] {
+                let left_group = &left.records[left_run.0..left_run.1];
+                match right_run {
+                    Some(run) => subtract_group(
+                        left_group,
+                        &right.records[run.0..run.1],
+                        &mut cover,
+                        &mut out,
+                    ),
+                    // No set-2 interval on this group: every set-1 interval
+                    // survives whole.
+                    None => out.extend(left_group.iter().map(|q| MinInterval {
+                        start: q.start,
+                        end: q.end,
+                        idx: q.idx,
+                    })),
                 }
             }
-        }
+            out
+        })
+        .collect();
 
-        // Optionally, you can look ahead to the next event's position
-        // to handle the "between events" region if needed.
-        // But typically, the creation of sub-intervals at boundaries is enough.
-
-        // 3. Move on to the next event
+    let mut out_events: Vec<MinInterval<T>> =
+        Vec::with_capacity(collected.iter().map(Vec::len).sum());
+    for batch in collected {
+        out_events.extend(batch);
     }
+
     if sort_output {
+        // Stable, so an input interval's surviving pieces stay in ascending
+        // coordinate order — the order they were emitted in.
         sort_by_key(&mut out_events, |i| i.idx);
     }
 
-    // No final cleanup is strictly necessary if every set1 interval has a corresponding end event.
     let mut out_idxs = Vec::with_capacity(out_events.len());
     let mut out_starts = Vec::with_capacity(out_events.len());
     let mut out_ends = Vec::with_capacity(out_events.len());
@@ -165,4 +101,272 @@ pub fn sweep_line_subtract<G: GroupType, T: PositionType>(
     }
 
     (out_idxs, out_starts, out_ends)
+}
+
+/// Each left group run paired with the right run of the same group, if any.
+///
+/// Unlike the overlap sweeps, subtract has to visit left groups the right side
+/// does not have: those intervals survive untouched.
+fn left_runs_with_right<C: GroupType, T: PositionType>(
+    left: &SortedRecords<C, T>,
+    right: &SortedRecords<C, T>,
+) -> Vec<(GroupRun, Option<GroupRun>)> {
+    let mut out = Vec::with_capacity(left.runs.len());
+    let mut j = 0usize;
+    for &left_run in &left.runs {
+        let group = left.records[left_run.0].group;
+        while j < right.runs.len() && right.records[right.runs[j].0].group < group {
+            j += 1;
+        }
+        let matched = right
+            .runs
+            .get(j)
+            .filter(|run| right.records[run.0].group == group)
+            .copied();
+        out.push((left_run, matched));
+    }
+    out
+}
+
+/// Subtract one group's right intervals from its left intervals.
+///
+/// `cover` is scratch owned by the caller so the allocation survives across
+/// groups; it is cleared on entry.
+fn subtract_group<C: GroupType, T: PositionType>(
+    left: &[IntervalRecord<C, T>],
+    right: &[IntervalRecord<C, T>],
+    cover: &mut Vec<(T, T)>,
+    out: &mut Vec<MinInterval<T>>,
+) {
+    // The union of the right intervals, as a disjoint ascending cover. `right`
+    // is already sorted by start, so this is one linear pass. Touching intervals
+    // are merged too: the zero-length gap between them would never be emitted.
+    cover.clear();
+    for target in right {
+        if target.end <= target.start {
+            continue;
+        }
+        match cover.last_mut() {
+            Some(last) if target.start <= last.1 => {
+                if target.end > last.1 {
+                    last.1 = target.end;
+                }
+            }
+            _ => cover.push((target.start, target.end)),
+        }
+    }
+
+    // `left` is sorted by start, so the first cover interval that can matter
+    // only ever moves forward.
+    let mut first = 0usize;
+    for query in left {
+        while first < cover.len() && cover[first].1 <= query.start {
+            first += 1;
+        }
+
+        let mut cursor = query.start;
+        let mut index = first;
+        while index < cover.len() && cover[index].0 < query.end {
+            if cover[index].0 > cursor {
+                out.push(MinInterval {
+                    start: cursor,
+                    end: cover[index].0,
+                    idx: query.idx,
+                });
+            }
+            cursor = cover[index].1;
+            if cursor >= query.end {
+                break;
+            }
+            index += 1;
+        }
+
+        if cursor < query.end {
+            out.push(MinInterval {
+                start: cursor,
+                end: query.end,
+                idx: query.idx,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sweep_line_subtract;
+
+    type Group = u32;
+    type Pos = i64;
+
+    /// Deterministic SplitMix64, so these tests need no dev-dependency.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn random_intervals(
+        state: &mut u64,
+        n: usize,
+        groups: u64,
+        span: u64,
+        max_len: u64,
+    ) -> (Vec<Group>, Vec<Pos>, Vec<Pos>) {
+        let mut chrs = Vec::with_capacity(n);
+        let mut starts = Vec::with_capacity(n);
+        let mut ends = Vec::with_capacity(n);
+        for _ in 0..n {
+            chrs.push((next(state) % groups) as Group);
+            let start = (next(state) % span) as Pos;
+            let len = 1 + (next(state) % max_len) as Pos;
+            starts.push(start);
+            ends.push(start + len);
+        }
+        (chrs, starts, ends)
+    }
+
+    /// Subtraction computed one coordinate at a time. Independent of the kernel,
+    /// so it pins the result rather than restating the algorithm.
+    fn brute_force(
+        chrs: &[Group],
+        starts: &[Pos],
+        ends: &[Pos],
+        chrs2: &[Group],
+        starts2: &[Pos],
+        ends2: &[Pos],
+    ) -> Vec<(u32, Pos, Pos)> {
+        let mut out = Vec::new();
+        for q in 0..chrs.len() {
+            let mut open: Option<Pos> = None;
+            for pos in starts[q]..ends[q] {
+                let covered = (0..chrs2.len()).any(|t| {
+                    chrs2[t] == chrs[q] && starts2[t] <= pos && pos < ends2[t]
+                });
+                match (covered, open) {
+                    (true, Some(from)) => {
+                        out.push((q as u32, from, pos));
+                        open = None;
+                    }
+                    (false, None) => open = Some(pos),
+                    _ => {}
+                }
+            }
+            if let Some(from) = open {
+                out.push((q as u32, from, ends[q]));
+            }
+        }
+        out
+    }
+
+    fn run(
+        chrs: &[Group],
+        starts: &[Pos],
+        ends: &[Pos],
+        chrs2: &[Group],
+        starts2: &[Pos],
+        ends2: &[Pos],
+    ) -> Vec<(u32, Pos, Pos)> {
+        let (idx, s, e) = sweep_line_subtract(chrs, starts, ends, chrs2, starts2, ends2, true);
+        idx.into_iter().zip(s).zip(e).map(|((i, s), e)| (i, s, e)).collect()
+    }
+
+    #[test]
+    fn subtract_matches_brute_force_on_small_random_input() {
+        let mut state = 0x5EED;
+        for _ in 0..40 {
+            let (chrs, starts, ends) = random_intervals(&mut state, 40, 3, 120, 30);
+            let (chrs2, starts2, ends2) = random_intervals(&mut state, 40, 3, 120, 30);
+            assert_eq!(
+                run(&chrs, &starts, &ends, &chrs2, &starts2, &ends2),
+                brute_force(&chrs, &starts, &ends, &chrs2, &starts2, &ends2)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_and_touching_targets_are_covered_once() {
+        // [5, 100) fully contains [10, 20); [20, 30) touches it. The union is
+        // [5, 100), so only the head and tail of the query survive.
+        let chrs = [0_u32, 0];
+        let starts = [0_i64, 200];
+        let ends = [150_i64, 300];
+        let chrs2 = [0_u32, 0, 0];
+        let starts2 = [5_i64, 10, 20];
+        let ends2 = [100_i64, 20, 30];
+
+        assert_eq!(
+            run(&chrs, &starts, &ends, &chrs2, &starts2, &ends2),
+            vec![(0, 0, 5), (0, 100, 150), (1, 200, 300)]
+        );
+    }
+
+    #[test]
+    fn a_left_group_with_no_right_group_survives_whole() {
+        let chrs = [0_u32, 7];
+        let starts = [0_i64, 0];
+        let ends = [10_i64, 10];
+        let chrs2 = [0_u32];
+        let starts2 = [2_i64];
+        let ends2 = [4_i64];
+
+        assert_eq!(
+            run(&chrs, &starts, &ends, &chrs2, &starts2, &ends2),
+            vec![(0, 0, 2), (0, 4, 10), (1, 0, 10)]
+        );
+    }
+
+    #[test]
+    fn unsorted_output_holds_the_same_rows_as_sorted_output() {
+        let mut state = 0xB0B;
+        let (chrs, starts, ends) = random_intervals(&mut state, 5_000, 4, 20_000, 200);
+        let (chrs2, starts2, ends2) = random_intervals(&mut state, 5_000, 4, 20_000, 200);
+
+        let mut sorted = run(&chrs, &starts, &ends, &chrs2, &starts2, &ends2);
+        let (idx, s, e) =
+            sweep_line_subtract(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, false);
+        let mut unsorted: Vec<(u32, i64, i64)> =
+            idx.into_iter().zip(s).zip(e).map(|((i, s), e)| (i, s, e)).collect();
+
+        sorted.sort_unstable();
+        unsorted.sort_unstable();
+        assert_eq!(sorted, unsorted);
+    }
+
+    /// Above `PARALLEL_THRESHOLD` the records are partitioned and the groups are
+    /// swept on separate threads; the result must not depend on that.
+    #[test]
+    fn parallel_and_serial_sized_inputs_agree() {
+        let mut state = 0xFACE;
+        let (chrs, starts, ends) = random_intervals(&mut state, 150_000, 5, 400_000, 500);
+        let (chrs2, starts2, ends2) = random_intervals(&mut state, 150_000, 5, 400_000, 500);
+
+        let big = run(&chrs, &starts, &ends, &chrs2, &starts2, &ends2);
+
+        // Same data, one group at a time, below the parallel threshold.
+        let mut expected: Vec<(u32, i64, i64)> = Vec::new();
+        for group in 0..5_u32 {
+            let rows: Vec<usize> = (0..chrs.len()).filter(|&i| chrs[i] == group).collect();
+            let rows2: Vec<usize> = (0..chrs2.len()).filter(|&i| chrs2[i] == group).collect();
+            let (lc, ls, le): (Vec<u32>, Vec<i64>, Vec<i64>) = (
+                rows.iter().map(|&i| chrs[i]).collect(),
+                rows.iter().map(|&i| starts[i]).collect(),
+                rows.iter().map(|&i| ends[i]).collect(),
+            );
+            let (rc, rs, re): (Vec<u32>, Vec<i64>, Vec<i64>) = (
+                rows2.iter().map(|&i| chrs2[i]).collect(),
+                rows2.iter().map(|&i| starts2[i]).collect(),
+                rows2.iter().map(|&i| ends2[i]).collect(),
+            );
+            for (i, s, e) in run(&lc, &ls, &le, &rc, &rs, &re) {
+                expected.push((rows[i as usize] as u32, s, e));
+            }
+        }
+        expected.sort_unstable();
+
+        let mut got = big;
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
 }

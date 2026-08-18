@@ -5,7 +5,7 @@ use crate::{
     sorts,
 };
 
-pub fn sweep_line_complement<G: GroupType, T: PositionType>(
+pub fn sweep_line_complement<G: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     chrs: &[G],
     starts: &[T],
     ends: &[T],
@@ -24,7 +24,7 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
     }
 
     // Build your events array, sorted by chr and pos
-    let events = sorts::build_sorted_events_single_collection(chrs, starts, ends, slack);
+    let events = sorts::build_sorted_events_single_collection_par(chrs, starts, ends, slack);
 
     // Initialize
     let mut current_chr = events[0].chr;

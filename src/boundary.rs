@@ -10,7 +10,7 @@ use crate::{
 /// intervals the group contains. The index identifies the group, not a
 /// particular interval within it; callers must not depend on *which* member is
 /// reported, only that it belongs to the group.
-pub fn sweep_line_boundary<G: GroupType, T: PositionType>(
+pub fn sweep_line_boundary<G: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     chrs: &[G],
     starts: &[T],
     ends: &[T],
@@ -24,7 +24,7 @@ pub fn sweep_line_boundary<G: GroupType, T: PositionType>(
         return (out_indices, out_starts, out_ends, counts);
     };
 
-    let events = sorts::build_sorted_events_single_collection(chrs, starts, ends, T::zero());
+    let events = sorts::build_sorted_events_single_collection_par(chrs, starts, ends, T::zero());
 
     let mut current_chr = events.first().unwrap().chr;
     let mut current_start = events.first().unwrap().pos;

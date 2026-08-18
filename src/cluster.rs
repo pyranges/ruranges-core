@@ -3,7 +3,7 @@ use crate::{
     sorts,
 };
 
-pub fn sweep_line_cluster<G: GroupType, T: PositionType>(
+pub fn sweep_line_cluster<G: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     chrs: &[G],
     starts: &[T],
     ends: &[T],
@@ -16,7 +16,7 @@ pub fn sweep_line_cluster<G: GroupType, T: PositionType>(
         return (cluster_ids, indices);
     };
 
-    let events = sorts::build_sorted_events_single_collection(chrs, starts, ends, slack);
+    let events = sorts::build_sorted_events_single_collection_par(chrs, starts, ends, slack);
 
     let mut current_chr = events.first().unwrap().chr;
     let mut current_cluster = 0;
