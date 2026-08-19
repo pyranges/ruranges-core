@@ -130,6 +130,12 @@ pub fn build_sorted_intervals<C: GroupType, T: PositionType>(
     intervals
 }
 
+/// Half-open offsets of each group's run in a group-major array.
+pub type GroupRuns = Vec<(usize, usize)>;
+
+/// A sorted interval array together with each group's run in it.
+pub type SortedIntervals<C, T> = (Vec<Interval<C, T>>, GroupRuns);
+
 /// Parallel counterpart of [`build_sorted_intervals`] with **byte-identical**
 /// output, used by the merge and max-disjoint kernels.
 ///
@@ -147,14 +153,70 @@ pub fn build_sorted_intervals_par<C: GroupType + Send + Sync, T: PositionType + 
     slack: T,
     sort_on_ends_too: bool,
 ) -> Vec<Interval<C, T>> {
+    build_sorted_intervals_par_inner(
+        chrs,
+        starts,
+        ends,
+        sort_reverse_direction,
+        slack,
+        sort_on_ends_too,
+    )
+    .0
+}
+
+/// [`build_sorted_intervals_par`] together with the half-open offsets of each
+/// group's run in the result.
+///
+/// Every per-group sweep needs those offsets, and recovering them from the
+/// sorted array is a serial pass over `24 * n` bytes — 2.4 GiB at 10^8 rows, on
+/// one thread, after all the parallel work is done. The counting partition
+/// already knows where each group starts, so on the paths that use it the runs
+/// come free; the remaining paths pay a scan of the *group ids* instead of the
+/// intervals, which is six times narrower.
+pub fn build_sorted_intervals_par_with_runs<
+    C: GroupType + Send + Sync,
+    T: PositionType + Send + Sync,
+>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    sort_reverse_direction: Option<&[bool]>,
+    slack: T,
+    sort_on_ends_too: bool,
+) -> SortedIntervals<C, T> {
+    let (intervals, runs) = build_sorted_intervals_par_inner(
+        chrs,
+        starts,
+        ends,
+        sort_reverse_direction,
+        slack,
+        sort_on_ends_too,
+    );
+    let runs = runs.unwrap_or_else(|| partition::runs_by(&intervals, |i| i.group));
+    (intervals, runs)
+}
+
+/// The shared body. The group runs are returned whenever the path that ran knew
+/// them anyway, so `build_sorted_intervals_par` never pays to compute them.
+fn build_sorted_intervals_par_inner<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    chrs: &[C],
+    starts: &[T],
+    ends: &[T],
+    sort_reverse_direction: Option<&[bool]>,
+    slack: T,
+    sort_on_ends_too: bool,
+) -> (Vec<Interval<C, T>>, Option<GroupRuns>) {
     if chrs.len() < partition::PARALLEL_THRESHOLD {
-        return build_sorted_intervals(
-            chrs,
-            starts,
-            ends,
-            sort_reverse_direction,
-            slack,
-            sort_on_ends_too,
+        return (
+            build_sorted_intervals(
+                chrs,
+                starts,
+                ends,
+                sort_reverse_direction,
+                slack,
+                sort_on_ends_too,
+            ),
+            None,
         );
     }
 
@@ -167,7 +229,12 @@ pub fn build_sorted_intervals_par<C: GroupType + Send + Sync, T: PositionType + 
     if sort_reverse_direction.is_none()
         && is_input_group_coord_sorted(chrs, starts, ends, &block_list, sort_on_ends_too)
     {
-        return build_intervals_par(chrs, starts, ends, slack, &block_list);
+        // The rows keep their input positions here, so the group ids carry the
+        // runs directly and never have to be read back out of the intervals.
+        return (
+            build_intervals_par(chrs, starts, ends, slack, &block_list),
+            Some(partition::runs_by(chrs, |chr| *chr)),
+        );
     }
 
     // Make each group contiguous with the parallel counting partition rather
@@ -188,7 +255,7 @@ pub fn build_sorted_intervals_par<C: GroupType + Send + Sync, T: PositionType + 
                     });
                 });
             sort_groups_by_coordinate(&mut intervals, &runs, sort_on_ends_too);
-            return intervals;
+            return (intervals, Some(runs));
         }
     }
 
@@ -197,7 +264,64 @@ pub fn build_sorted_intervals_par<C: GroupType + Send + Sync, T: PositionType + 
     let runs = partition::runs_by(&intervals, |i| i.group);
     sort_groups_by_coordinate(&mut intervals, &runs, sort_on_ends_too);
 
-    intervals
+    (intervals, Some(runs))
+}
+
+/// Largest coordinate, and largest slack, the narrowed builder will accept.
+///
+/// Halving the `i32` range leaves the sweeps room to add a slack to an end
+/// without overflowing: `2^30 + (2^30 - 1)` is exactly `i32::MAX`, and the
+/// negative side lands on `i32::MIN`. Genomic coordinates are two orders of
+/// magnitude below the bound; protein ones are five.
+pub const NARROW_COORDINATE_LIMIT: i64 = 1 << 30;
+
+/// True when a slack is small enough to add to a narrowed coordinate.
+pub fn slack_fits_narrow(slack: i64) -> bool {
+    slack.unsigned_abs() < NARROW_COORDINATE_LIMIT as u64
+}
+
+/// Build the group-major sorted interval array with `i32` coordinates from
+/// `i64` inputs, together with each group's run.
+///
+/// The sort moves a third less data this way — an `Interval<u32, i32>` is 16
+/// bytes against 24 — and the narrowing itself is free, because the partition
+/// already copies every coordinate once and can convert as it writes. Genomic
+/// readers hand out `Int64` columns for coordinates that never leave `i32`, so
+/// this is the usual case rather than a special one.
+///
+/// Returns `None` when the input is too small to be worth partitioning, when a
+/// coordinate is outside [`NARROW_COORDINATE_LIMIT`], or when the counting
+/// partition declines; the caller then stays on its `i64` path.
+pub fn build_sorted_narrowed_intervals_par<C: GroupType + Send + Sync>(
+    chrs: &[C],
+    starts: &[i64],
+    ends: &[i64],
+) -> Option<SortedIntervals<C, i32>> {
+    if chrs.len() < partition::PARALLEL_THRESHOLD || !fits_narrow(starts, ends) {
+        return None;
+    }
+
+    let (layout, block_list) = partition::plan_group_major(chrs, 1)?;
+    let runs = layout.group_runs();
+    let mut intervals = partition::scatter_group_major(chrs, &block_list, layout, 1, |row, slots| {
+        slots[0].write(Interval {
+            group: chrs[row],
+            start: starts[row] as i32,
+            end: ends[row] as i32,
+            idx: row as u32,
+        });
+    });
+    sort_groups_by_coordinate(&mut intervals, &runs, false);
+
+    Some((intervals, runs))
+}
+
+/// True when every coordinate is within [`NARROW_COORDINATE_LIMIT`].
+fn fits_narrow(starts: &[i64], ends: &[i64]) -> bool {
+    let in_range = |value: &i64| (-NARROW_COORDINATE_LIMIT..=NARROW_COORDINATE_LIMIT).contains(value);
+    partition::blocks(starts.len())
+        .par_iter()
+        .all(|&(from, to)| starts[from..to].iter().all(in_range) && ends[from..to].iter().all(in_range))
 }
 
 /// Sort each group's slice by start (and end first, when asked), one task per

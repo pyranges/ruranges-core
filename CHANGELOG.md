@@ -25,6 +25,29 @@ almost nothing (hg38 10^8, one thread → twelve: `overlap(multiple=true)` 37.3 
   and `build_sorted_events_single_collection_par` are the new builders; `merge`,
   `max_disjoint`, `cluster`, `split`, `boundary` and `complement` use them.
   Output is unchanged in every case, and the parity is under test.
+- **`sweep_line_cluster` sweeps intervals, not events.** Clustering asks the same
+  question merging does — an interval joins the run in progress exactly when
+  `start < max_end + slack` — so it now sorts one record per interval instead of
+  one event per endpoint, and scans each group on its own thread. The event
+  phrasing sorted twice the elements and then walked them in a single serial pass
+  over the whole genome, which is why only its sort saw more than one core. Ids
+  are numbered exactly as before, gaps at group boundaries included; a serial
+  prefix sum over the per-group cluster counts reproduces them. At hg38 10^8 the
+  sweep goes 4.38 s → 1.35 s on one thread and 1.61 s → 0.32 s on twelve.
+- **Coordinates that fit `i32` are swept as `i32`.** An `Interval<u32, i32>` is
+  16 bytes against 24, so the sort moves a third less data, and the narrowing is
+  free: the counting partition already copies every coordinate once and converts
+  as it writes. Genomic readers hand out `Int64` columns for coordinates that
+  never leave `i32`, so this is the usual case. `sweep_line_merge_narrowed` and
+  `sweep_line_cluster_narrowed` take `i64` slices and return `None` — leaving the
+  caller on its existing path — when a coordinate or the slack is outside
+  ±2^30, the bound that leaves the sweeps room to add a slack to an end without
+  overflowing.
+- **The interval builder hands back the group runs.** Recovering them afterwards
+  is a serial pass over the sorted array, which is 2.4 GB at 10^8 rows and runs
+  after all the parallel work is done. The counting partition already knows where
+  each group starts, so `build_sorted_intervals_par_with_runs` returns them;
+  `build_sorted_intervals_par` is unchanged and never pays to compute them.
 - **`sweep_line_subtract` no longer builds an event list or a hash map.**
   Subtracting a set is the same as subtracting its union, so it now sorts each
   side once, walks each group's right intervals into a disjoint cover, and emits
@@ -58,6 +81,12 @@ almost nothing (hg38 10^8, one thread → twelve: `overlap(multiple=true)` 37.3 
 - The kernels listed above gained `Send + Sync` bounds on their group and
   position type parameters. Every primitive that satisfies `GroupType` or
   `PositionType` already satisfies them, so no existing call site needs an edit.
+- `sweep_line_merge_narrowed` and `sweep_line_cluster_narrowed` are the `i64`
+  entry points to the narrowed sweeps, and `sorts::build_sorted_narrowed_intervals_par`
+  the builder behind them. `sorts::NARROW_COORDINATE_LIMIT` and
+  `sorts::slack_fits_narrow` name the bound they apply.
+- `sorts::build_sorted_intervals_par_with_runs` returns each group's run
+  alongside the sorted intervals.
 
 ### Behaviour
 
@@ -73,6 +102,13 @@ almost nothing (hg38 10^8, one thread → twelve: `overlap(multiple=true)` 37.3 
   `overlap_indices` and `sweep_line_subtract` may differ from 0.1.13; the rows
   themselves do not. Subtract's old order came from `FxHashMap` iteration and was
   arbitrary; it is now deterministic. `sort_output = true` is unaffected.
+- **Intervals of non-positive length in `cluster`.** An interval whose end does
+  not exceed its start now opens a cluster like any other, and closes it at its
+  start. Under the event sweep its end event sorted before its own start event,
+  which drove the live count negative and could leave the following intervals
+  labelled with a cluster that had already been closed. As with `subtract`,
+  `polaranges` rejects these before the kernel, so only direct callers were
+  exposed.
 
 ## 0.1.13
 
