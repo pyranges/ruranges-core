@@ -70,6 +70,43 @@ almost nothing (hg38 10^8, one thread → twelve: `overlap(multiple=true)` 37.3 
   256-query sample decides whether the extra end sort is repaid, because on sparse
   input it is not. `contained_intervals_only` is a different predicate and keeps
   the sweep.
+- **`count_overlaps` was the last serial kernel, and the slowest thing here.** It
+  built its records with the serial radix and then walked them in one pass whose
+  per-query step scans the live candidate window — so its cost grew with the
+  number of candidate *pairs*, not with the input. On 634k-group proteome input at
+  10^8 rows that is 229 s against `merge`'s 4.3 s. It now takes the same two paths
+  `overlap_indices` does: groups made contiguous by the counting partition, each
+  counted on its own task, and the BITS closed form where a group's density
+  repays its end sort. Same counts, in the same input row order — every count is
+  written by the one task that owns its row's group. At twelve threads the
+  operation goes 229 s → 9.1 s on proteome 10^8 and 25.2 s → 6.9 s on hg38 10^8.
+- **The binary kernels sweep narrow coordinates as `i32`**, as `merge` and
+  `cluster` already did. `sorted_records_narrowed_par` converts while the
+  partition copies, so a 16-byte `IntervalRecord<u32, i32>` is sorted where a
+  24-byte one used to be, and the entry points below return `None` — leaving the
+  caller on its existing path — when a coordinate or the slack is out of range.
+  `subtract` widens its surviving pieces back to `i64`; `overlaps`,
+  `overlap_indices` and `count_overlaps` return row numbers and counts, so
+  nothing widens.
+- **`nearest` builds its six sorted views in parallel.** It was still calling the
+  serial record builder and sorting its event arrays with two whole-array radix
+  passes; both now take the counting partition, and the narrowed entry point
+  converts the coordinates once up front rather than per view. At hg38 10^8 on
+  twelve threads the build stage goes 2.26 s → 0.47 s, and the operation 6.3 s →
+  4.6 s.
+- **The counting partition declines when its bookkeeping would outweigh the
+  data.** The histogram is one counter per (block, group) and the prefix sum over
+  it is serial, so a frame with a few rows per group — a proteome frame at 10^6
+  rows has 340k groups, three rows each — spent more time on the histogram than
+  on the rows. It now asks for no more blocks than the pool can run several of at
+  once, and hands back `None` when `blocks * groups` would exceed the row count;
+  the callers all keep a radix path. The narrowed builder takes that path too, so
+  the narrowing survives a frame the partition declines.
+- **Per-group sorts use insertion sort below 32 elements.** The radix sort's cost
+  per *call* dominates on short runs, and short runs are the normal case on a
+  high-cardinality frame: building 10^6 records over 340k groups spent 0.127 s in
+  the per-group sorts against 0.016 s now. Both are stable, so the output is
+  unchanged.
 
 ### API
 
@@ -85,6 +122,16 @@ almost nothing (hg38 10^8, one thread → twelve: `overlap(multiple=true)` 37.3 
   entry points to the narrowed sweeps, and `sorts::build_sorted_narrowed_intervals_par`
   the builder behind them. `sorts::NARROW_COORDINATE_LIMIT` and
   `sorts::slack_fits_narrow` name the bound they apply.
+- `sweep_line_subtract_narrowed`, `overlaps_narrowed`,
+  `overlap_indices_chunked_narrowed`, `count_overlaps_narrowed` and
+  `nearest_with_ties_narrowed` are the `i64` entry points to the narrowed binary
+  kernels. `nearest` takes `sorts::NARROW_DISTANCE_LIMIT`, half the usual bound:
+  its answer is a *difference* of two coordinates, so the whole span a group can
+  hold has to fit `i32`, not just each endpoint. It therefore declines inputs the
+  other four accept.
+- `count_overlaps` and `nearest_with_ties` gained `Send + Sync` bounds on their
+  type parameters, as the kernels above already had. Every primitive that
+  satisfies `GroupType` or `PositionType` already satisfies them.
 - `sorts::build_sorted_intervals_par_with_runs` returns each group's run
   alongside the sorted intervals.
 

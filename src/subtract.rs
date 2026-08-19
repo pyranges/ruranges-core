@@ -1,6 +1,9 @@
 use radsort::sort_by_key;
 
-use crate::overlaps::{sorted_records_par, GroupRun, IntervalRecord, SortedRecords};
+use crate::overlaps::{
+    pair_fits_narrow, sorted_records_narrowed_par, sorted_records_par, GroupRun, IntervalRecord,
+    SortedRecords,
+};
 use crate::partition;
 use crate::ruranges_structs::{GroupType, MinInterval, PositionType};
 use rayon::prelude::*;
@@ -44,7 +47,53 @@ pub fn sweep_line_subtract<G: GroupType + Send + Sync, T: PositionType + Send + 
 
     let left = sorted_records_par(chrs1, starts1, ends1, false);
     let right = sorted_records_par(chrs2, starts2, ends2, false);
-    let paired = left_runs_with_right(&left, &right);
+    subtract_from_sorted(&left, &right, sort_output)
+}
+
+/// [`sweep_line_subtract`] over `i64` coordinates narrow enough to sweep as
+/// `i32`, which sorts a third less data for the same answer.
+///
+/// `None` when the narrowing does not apply — see
+/// [`crate::overlaps::sorted_records_narrowed_par`] — leaving the caller to run
+/// [`sweep_line_subtract`] as it stands.
+pub fn sweep_line_subtract_narrowed<G: GroupType + Send + Sync>(
+    chrs1: &[G],
+    starts1: &[i64],
+    ends1: &[i64],
+    chrs2: &[G],
+    starts2: &[i64],
+    ends2: &[i64],
+    sort_output: bool,
+) -> Option<(Vec<u32>, Vec<i64>, Vec<i64>)> {
+    if chrs1.is_empty() || chrs2.is_empty() {
+        return None;
+    }
+    // Subtraction carries no slack, so only the coordinates have to fit.
+    if !pair_fits_narrow(starts1, ends1, starts2, ends2, 0) {
+        return None;
+    }
+
+    let left = sorted_records_narrowed_par(chrs1, starts1, ends1, false)?;
+    let right = sorted_records_narrowed_par(chrs2, starts2, ends2, false)?;
+    let (idxs, starts, ends) = subtract_from_sorted(&left, &right, sort_output);
+
+    // Every surviving piece lies inside its input interval, so widening back is
+    // one pass over the output — far less than the narrow sort saved.
+    Some((
+        idxs,
+        starts.into_iter().map(i64::from).collect(),
+        ends.into_iter().map(i64::from).collect(),
+    ))
+}
+
+/// Subtract right from left, given both sides already group-major and
+/// start-sorted.
+fn subtract_from_sorted<G: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    left: &SortedRecords<G, T>,
+    right: &SortedRecords<G, T>,
+    sort_output: bool,
+) -> (Vec<u32>, Vec<T>, Vec<T>) {
+    let paired = left_runs_with_right(left, right);
 
     let batches = partition::batch_runs(&paired, partition::BATCH_ROWS, |&(l, r)| {
         (l.1 - l.0) + r.map_or(0, |run| run.1 - run.0)

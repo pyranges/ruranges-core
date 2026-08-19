@@ -316,9 +316,24 @@ pub fn build_sorted_narrowed_intervals_par<C: GroupType + Send + Sync>(
     Some((intervals, runs))
 }
 
+/// Largest coordinate a sweep that returns a *distance* will accept.
+///
+/// [`NARROW_COORDINATE_LIMIT`] bounds each endpoint, which is all a sweep
+/// needs when it only ever compares two coordinates. `nearest` subtracts them:
+/// its answer is `target - query + 1`, so what has to fit `i32` is the whole
+/// span a group can hold, and two coordinates at opposite ends of the wider
+/// bound are `2^31` apart — one past `i32::MAX`. Halving the bound halves the
+/// span. Human chr1, the longest, is 2.49e8 against this 5.37e8.
+pub const NARROW_DISTANCE_LIMIT: i64 = 1 << 29;
+
 /// True when every coordinate is within [`NARROW_COORDINATE_LIMIT`].
-fn fits_narrow(starts: &[i64], ends: &[i64]) -> bool {
-    let in_range = |value: &i64| (-NARROW_COORDINATE_LIMIT..=NARROW_COORDINATE_LIMIT).contains(value);
+pub(crate) fn fits_narrow(starts: &[i64], ends: &[i64]) -> bool {
+    fits_narrow_within(starts, ends, NARROW_COORDINATE_LIMIT)
+}
+
+/// True when every coordinate is within `limit` of zero.
+pub(crate) fn fits_narrow_within(starts: &[i64], ends: &[i64], limit: i64) -> bool {
+    let in_range = |value: &i64| (-limit..=limit).contains(value);
     partition::blocks(starts.len())
         .par_iter()
         .all(|&(from, to)| starts[from..to].iter().all(in_range) && ends[from..to].iter().all(in_range))
@@ -333,9 +348,9 @@ fn sort_groups_by_coordinate<C: GroupType + Send + Sync, T: PositionType + Send 
 ) {
     partition::par_groups_mut(intervals, runs, |group| {
         if sort_on_ends_too {
-            sort_by_key(&mut *group, |i| i.end);
+            partition::sort_run_by_key(&mut *group, |i| i.end);
         }
-        sort_by_key(group, |i| i.start);
+        partition::sort_run_by_key(group, |i| i.start);
     });
 }
 
@@ -585,18 +600,45 @@ pub fn build_sorted_events_single_collection_par<
     };
 
     partition::par_groups_mut(&mut events, &runs, |group| {
-        sort_by_key(&mut *group, |e| e.is_start);
-        sort_by_key(group, |e| e.pos);
+        partition::sort_run_by_key(&mut *group, |e| e.is_start);
+        partition::sort_run_by_key(group, |e| e.pos);
     });
 
     events
 }
 
-pub fn build_sorted_events_single_collection_separate_outputs<C: GroupType, T: PositionType>(
+/// One event per row, ordered by `(group, pos - slack)`.
+///
+/// The counting partition makes the groups contiguous on every core and each
+/// group's events are then sorted on their own task, which is the same output
+/// the two whole-array radix passes below produce: the partition is stable and
+/// radsort is stable, so equal `(group, pos)` events keep row order either way.
+pub fn build_sorted_events_single_collection_separate_outputs<
+    C: GroupType + Send + Sync,
+    T: PositionType + Send + Sync,
+>(
     chrs: &[C],
     pos: &[T],
     slack: T,
 ) -> Vec<MinEvent<C, T>> {
+    if chrs.len() >= partition::PARALLEL_THRESHOLD {
+        if let Some((layout, block_list)) = partition::plan_group_major(chrs, 1) {
+            let runs = layout.group_runs();
+            let mut events =
+                partition::scatter_group_major(chrs, &block_list, layout, 1, |row, slots| {
+                    slots[0].write(MinEvent {
+                        chr: chrs[row],
+                        pos: pos[row] - slack,
+                        idx: row as u32,
+                    });
+                });
+            partition::par_groups_mut(&mut events, &runs, |group| {
+                partition::sort_run_by_key(group, |e| e.pos)
+            });
+            return events;
+        }
+    }
+
     let mut out_pos: Vec<MinEvent<C, T>> = Vec::with_capacity(chrs.len());
 
     // Convert set1 intervals into events

@@ -30,6 +30,9 @@ const MAX_GROUP_SPAN: i64 = 16 << 20;
 /// Ceiling on the block-by-group histogram, which is `blocks * groups * 4` bytes.
 const MAX_HISTOGRAM_BYTES: usize = 512 << 20;
 
+/// Blocks the counting partition asks for per thread in the pool.
+const BLOCKS_PER_THREAD: usize = 4;
+
 /// Rows per parallel block: enough to amortise a task, small enough that twelve
 /// threads still get several blocks each at 10^6 rows.
 pub(crate) const BLOCK_ROWS: usize = 128 * 1024;
@@ -119,6 +122,52 @@ impl<T> SendPtr<T> {
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
+/// A `&mut [T]` many rayon tasks can scatter into at once.
+///
+/// The kernels that produce one value per input row work in group-major order,
+/// so the value for row `r` is computed by whichever task owns `r`'s group — and
+/// the row numbers a group holds are a subset of a permutation of `0..len`. Every
+/// destination is therefore written by exactly one task, which is the whole
+/// invariant; expressing it as disjoint `&mut` slices is not possible, because
+/// the indices are a permutation rather than a partition into ranges.
+pub(crate) struct ScatterSlice<'a, T> {
+    ptr: SendPtr<T>,
+    len: usize,
+    /// Ties the handle to the borrow it was made from, so it cannot outlive it.
+    marker: std::marker::PhantomData<&'a mut [T]>,
+}
+
+// Derived `Copy` would carry a `T: Copy` bound; the handle is always Copy.
+impl<T> Clone for ScatterSlice<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for ScatterSlice<'_, T> {}
+
+impl<'a, T> ScatterSlice<'a, T> {
+    pub(crate) fn new(slice: &'a mut [T]) -> Self {
+        Self {
+            len: slice.len(),
+            ptr: SendPtr(slice.as_mut_ptr()),
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Write one element.
+    ///
+    /// # Safety
+    ///
+    /// Over the whole parallel region, no two calls — on this handle or a copy
+    /// of it — may pass the same `index`, and nothing else may read or write the
+    /// slice while any of them is outstanding.
+    #[inline]
+    pub(crate) unsafe fn write(&self, index: usize, value: T) {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.get().add(index).write(value) };
+    }
+}
+
 /// Write cursors for a planned group-major partition.
 pub(crate) struct GroupLayout {
     /// `cursors[block * groups + group]`: next output index for that pair.
@@ -195,14 +244,29 @@ pub(crate) fn plan_group_major<C: GroupType + Send + Sync>(
     }
 
     // As many blocks as the histogram budget allows, never more than one per
-    // BLOCK_ROWS rows. With few groups that is the fine blocking; with hundreds of
-    // thousands of groups it is a few hundred larger blocks, which still gives
-    // every thread work but keeps the histogram to a few hundred MiB.
+    // BLOCK_ROWS rows, and never more than the pool can run several of at once.
+    let threads = rayon::current_num_threads();
     let affordable = MAX_HISTOGRAM_BYTES / groups.max(1) / 4;
-    if affordable < rayon::current_num_threads() {
+    if affordable < threads {
         return None; // not even one block per thread: keep the radix path
     }
-    let block_list = blocks_of(chrs.len(), affordable.min(scan_blocks.len()));
+    // That last cap is what keeps a high-cardinality frame affordable: the
+    // histogram is one counter per (block, group) and the prefix sum over it is
+    // serial, so on a 634k-group frame every extra block costs 634k counters to
+    // zero, fill and walk — for parallelism no thread is there to take. Blocks
+    // per thread is a work-stealing margin; the counting pass costs the same per
+    // row everywhere, so a small one is enough.
+    let wanted = threads.saturating_mul(BLOCKS_PER_THREAD).max(1);
+    let block_list = blocks_of(chrs.len(), affordable.min(scan_blocks.len()).min(wanted));
+
+    // The histogram is `blocks * groups` counters to zero, fill and then walk
+    // serially, against `chrs.len()` rows to place. A frame with a few rows per
+    // group — a proteome at 10^6 rows has 340k of them, three rows each — makes
+    // that bookkeeping bigger than the data, and the whole-array radix wins. The
+    // callers all keep a radix path for exactly this.
+    if block_list.len().saturating_mul(groups) > chrs.len() {
+        return None;
+    }
 
     // Per-block histograms, then an exclusive prefix sum in group-major order:
     // every row of group g precedes every row of group g+1, and within a group
@@ -334,6 +398,33 @@ where
                 body(&mut chunk[start - base..end - base]);
             }
         });
+}
+
+/// Longest run a per-group sort handles with insertion sort.
+///
+/// The radix sort's cost per *call* — a scratch buffer among it — dominates on
+/// short runs, and short runs are the normal case on a high-cardinality frame: a
+/// proteome frame at 10^6 rows has 340k groups, three rows each. Insertion sort
+/// is stable, which the group sorts rely on.
+const INSERTION_SORT_MAX: usize = 32;
+
+/// Sort one group's slice by `key`, stably.
+pub(crate) fn sort_run_by_key<E, K, F>(values: &mut [E], key: F)
+where
+    K: radsort::Key + PartialOrd,
+    F: Fn(&E) -> K + Copy,
+{
+    if values.len() > INSERTION_SORT_MAX {
+        radsort::sort_by_key(values, key);
+        return;
+    }
+    for index in 1..values.len() {
+        let mut cursor = index;
+        while cursor > 0 && key(&values[cursor - 1]) > key(&values[cursor]) {
+            values.swap(cursor - 1, cursor);
+            cursor -= 1;
+        }
+    }
 }
 
 /// Half-open offsets of each contiguous run of equal key in a slice already

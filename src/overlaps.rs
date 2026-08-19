@@ -5,6 +5,7 @@ use rayon::prelude::*;
 
 use crate::partition;
 use crate::ruranges_structs::{GroupType, OverlapPair, OverlapType, PositionType};
+use crate::sorts;
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct IntervalRecord<C: GroupType, T: PositionType> {
@@ -14,6 +15,9 @@ pub(crate) struct IntervalRecord<C: GroupType, T: PositionType> {
     pub(crate) idx: u32,
 }
 
+/// The serial reference for the two sort keys below. Every kernel takes
+/// [`sorted_records_par`] now; this is what that builder is checked against.
+#[cfg(test)]
 pub(crate) fn sorted_records<C: GroupType, T: PositionType>(
     groups: &[C],
     starts: &[T],
@@ -121,12 +125,92 @@ pub(crate) fn sorted_records_par<C: GroupType + Send + Sync, T: PositionType + S
     // already `idx`-ascending before any of these passes.
     partition::par_groups_mut(&mut records, &runs, |group| {
         if wide_key {
-            sort_by_key(&mut *group, |r| r.end);
+            partition::sort_run_by_key(&mut *group, |r| r.end);
         }
-        sort_by_key(group, |r| r.start);
+        partition::sort_run_by_key(group, |r| r.start);
     });
 
     SortedRecords { records, runs }
+}
+
+/// [`sorted_records_par`] over `i64` coordinates narrow enough to sweep as
+/// `i32`, which sorts a third less data for the same answer.
+///
+/// An `IntervalRecord<u32, i32>` is 16 bytes against 24, and the narrowing is
+/// free: the counting partition already copies every coordinate once and
+/// converts as it writes. Genomic readers hand out `Int64` columns for
+/// coordinates that never leave `i32`, so this is the usual case rather than a
+/// special one.
+///
+/// `None` when the input is too small to be worth partitioning, when a
+/// coordinate is outside [`sorts::NARROW_COORDINATE_LIMIT`], or when the
+/// counting partition declines; the caller then stays on its `i64` path.
+pub(crate) fn sorted_records_narrowed_par<C: GroupType + Send + Sync>(
+    groups: &[C],
+    starts: &[i64],
+    ends: &[i64],
+    wide_key: bool,
+) -> Option<SortedRecords<C, i32>> {
+    debug_assert_eq!(groups.len(), starts.len(), "groups/starts length mismatch");
+    debug_assert_eq!(groups.len(), ends.len(), "groups/ends length mismatch");
+
+    if groups.len() < partition::PARALLEL_THRESHOLD || !sorts::fits_narrow(starts, ends) {
+        return None;
+    }
+
+    let narrowed = |row: usize| IntervalRecord {
+        group: groups[row],
+        start: starts[row] as i32,
+        end: ends[row] as i32,
+        idx: row as u32,
+    };
+
+    // The same two paths, and the same fallback, as `sorted_records_par`: the
+    // counting partition when it pays, the whole-array radix when it does not.
+    // Narrowing is worth having either way — it is the *sort* that moves a third
+    // less data, not the partition.
+    let (mut records, runs) = match partition::plan_group_major(groups, 1) {
+        Some((layout, block_list)) => {
+            let runs = layout.group_runs();
+            let records =
+                partition::scatter_group_major(groups, &block_list, layout, 1, |row, slots| {
+                    slots[0].write(narrowed(row));
+                });
+            (records, runs)
+        }
+        None => {
+            let mut records: Vec<IntervalRecord<C, i32>> =
+                (0..groups.len()).map(narrowed).collect();
+            sort_by_key(&mut records, |r| r.group);
+            let runs = partition::runs_by(&records, |r| r.group);
+            (records, runs)
+        }
+    };
+
+    // Same two keys, and the same reasoning, as `sorted_records_par`.
+    partition::par_groups_mut(&mut records, &runs, |group| {
+        if wide_key {
+            partition::sort_run_by_key(&mut *group, |r| r.end);
+        }
+        partition::sort_run_by_key(group, |r| r.start);
+    });
+
+    Some(SortedRecords { records, runs })
+}
+
+/// True when both sides of a binary kernel, and its slack, fit the narrowed
+/// sweep. Checked before either side is built, so a wide right-hand side does
+/// not cost a narrowed sort of the left.
+pub(crate) fn pair_fits_narrow(
+    starts: &[i64],
+    ends: &[i64],
+    starts2: &[i64],
+    ends2: &[i64],
+    slack: i64,
+) -> bool {
+    sorts::slack_fits_narrow(slack)
+        && sorts::fits_narrow(starts, ends)
+        && sorts::fits_narrow(starts2, ends2)
 }
 
 fn build_records<C: GroupType, T: PositionType>(
@@ -209,6 +293,23 @@ where
             out
         })
         .collect()
+}
+
+/// [`par_paired_group_batches`] for a body that writes its own output rather
+/// than returning one — the counting kernels scatter straight into a result
+/// vector, so there is nothing to collect and concatenate.
+pub(crate) fn par_paired_groups_for_each<F>(pairs: &[PairedGroupRun], body: F)
+where
+    F: Fn(GroupRun, GroupRun) + Send + Sync,
+{
+    let batches = partition::batch_runs(pairs, partition::BATCH_ROWS, |&(l, r)| {
+        (l.1 - l.0) + (r.1 - r.0)
+    });
+    batches.into_par_iter().for_each(|batch| {
+        for &(left_run, right_run) in &pairs[batch] {
+            body(left_run, right_run);
+        }
+    });
 }
 
 /// [`par_paired_group_batches`], concatenated.
@@ -733,7 +834,53 @@ pub fn overlaps<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     pairs.into_iter().map(|pair| (pair.idx, pair.idx2)).unzip()
 }
 
-pub fn count_overlaps<C: GroupType, T: PositionType>(
+/// [`overlaps`] over `i64` coordinates narrow enough to sweep as `i32`, which
+/// sorts a third less data for the same answer.
+///
+/// `None` when the narrowing does not apply — see
+/// [`sorted_records_narrowed_par`]. The result is a pair of row numbers, so
+/// nothing widens back.
+#[allow(clippy::too_many_arguments)]
+pub fn overlaps_narrowed<C: GroupType + Send + Sync>(
+    chrs: &[C],
+    starts: &[i64],
+    ends: &[i64],
+    chrs2: &[C],
+    starts2: &[i64],
+    ends2: &[i64],
+    slack: i64,
+    overlap_type: &str,
+    sort_output: bool,
+    contained: bool,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let overlap_type = OverlapType::from_str(overlap_type).expect("invalid overlap_type string");
+    if !pair_fits_narrow(starts, ends, starts2, ends2, slack) {
+        return None;
+    }
+
+    let wide_key = wide_sort_key(overlap_type);
+    let left = sorted_records_narrowed_par(chrs, starts, ends, wide_key)?;
+    let right = sorted_records_narrowed_par(chrs2, starts2, ends2, wide_key)?;
+    let mut pairs =
+        collect_overlap_pairs_par(&left, &right, slack as i32, overlap_type, contained);
+
+    if sort_output {
+        sort_by_key(&mut pairs, |p| (p.idx, p.idx2));
+    }
+
+    Some(pairs.into_iter().map(|pair| (pair.idx, pair.idx2)).unzip())
+}
+
+/// How many right intervals each left interval overlaps, one count per left row,
+/// in input row order.
+///
+/// Each group is counted on its own thread, and a group dense enough for the
+/// sweep's cost to matter takes the BITS closed form instead — the same two
+/// choices [`crate::overlap_indices::overlap_indices_chunked`] makes, for the
+/// same reasons. Before this, `count_overlaps` was the last kernel still doing a
+/// serial radix sort followed by a single serial pass whose cost grew with the
+/// number of candidate *pairs*, which is quadratic on deep-coverage input.
+pub fn count_overlaps<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
     chrs: &[C],
     starts: &[T],
     ends: &[T],
@@ -742,101 +889,133 @@ pub fn count_overlaps<C: GroupType, T: PositionType>(
     ends2: &[T],
     slack: T,
 ) -> Vec<u32> {
-    // count_overlaps only returns a count per left interval, so it never cares
-    // which target was matched. Use the minimal `All` sort key.
-    let left = sorted_records(chrs, starts, ends, OverlapType::All);
-    let right = sorted_records(chrs2, starts2, ends2, OverlapType::All);
-
-    let n1 = left.len();
-    let n2 = right.len();
-
-    let mut counts = vec![0_u32; n1];
-
-    if n1 == 0 || n2 == 0 {
+    let mut counts = vec![0_u32; chrs.len()];
+    if chrs.is_empty() || chrs2.is_empty() {
         return counts;
     }
 
-    let mut i = 0usize;
-    let mut j = 0usize;
+    // A count cannot see *which* target was matched, so both sides take the
+    // minimal `(group, start)` key.
+    let left = sorted_records_par(chrs, starts, ends, false);
+    let right = sorted_records_par(chrs2, starts2, ends2, false);
+    count_from_sorted(&left, &right, slack, &mut counts);
+    counts
+}
 
-    let mut active: Vec<usize> = Vec::new();
-    let mut active_head: usize = 0;
-
-    while i < n1 && j < n2 {
-        let g1 = left[i].group;
-        let g2 = right[j].group;
-
-        if g1 < g2 {
-            let group = g1;
-            while i < n1 && left[i].group == group {
-                i += 1;
-            }
-            continue;
-        }
-
-        if g2 < g1 {
-            let group = g2;
-            while j < n2 && right[j].group == group {
-                j += 1;
-            }
-            continue;
-        }
-
-        let group = g1;
-
-        let i0 = i;
-        while i < n1 && left[i].group == group {
-            i += 1;
-        }
-        let i1 = i;
-
-        let j0 = j;
-        while j < n2 && right[j].group == group {
-            j += 1;
-        }
-        let j1 = j;
-
-        clear_active(&mut active, &mut active_head);
-
-        let mut jr = j0;
-
-        for query in left[i0..i1].iter().copied() {
-            let query_end_slack = query.end.saturating_add(slack);
-
-            while jr < j1 && right[jr].start < query_end_slack {
-                active.push(jr);
-                jr += 1;
-            }
-
-            while active_head < active.len() {
-                let r = active[active_head];
-                if right[r].end.saturating_add(slack) <= query.start {
-                    active_head += 1;
-                } else {
-                    break;
-                }
-            }
-
-            if active_head > 0 && active_head * 2 >= active.len() {
-                active.drain(0..active_head);
-                active_head = 0;
-            }
-
-            let mut count = 0_u32;
-
-            for idx in active_head..active.len() {
-                let target = right[active[idx]];
-
-                if overlaps_with_slack(query.start, query.end, target.start, target.end, slack) {
-                    count = count.saturating_add(1);
-                }
-            }
-
-            counts[query.idx as usize] = count;
-        }
+/// [`count_overlaps`] over `i64` coordinates narrow enough to sweep as `i32`.
+///
+/// `None` when the narrowing does not apply — see
+/// [`sorted_records_narrowed_par`] — leaving the caller on [`count_overlaps`].
+/// The counts themselves are `u32` either way, so nothing widens back.
+pub fn count_overlaps_narrowed<C: GroupType + Send + Sync>(
+    chrs: &[C],
+    starts: &[i64],
+    ends: &[i64],
+    chrs2: &[C],
+    starts2: &[i64],
+    ends2: &[i64],
+    slack: i64,
+) -> Option<Vec<u32>> {
+    if chrs.is_empty() || chrs2.is_empty() {
+        return None;
+    }
+    if !pair_fits_narrow(starts, ends, starts2, ends2, slack) {
+        return None;
     }
 
-    counts
+    let left = sorted_records_narrowed_par(chrs, starts, ends, false)?;
+    let right = sorted_records_narrowed_par(chrs2, starts2, ends2, false)?;
+
+    let mut counts = vec![0_u32; chrs.len()];
+    count_from_sorted(&left, &right, slack as i32, &mut counts);
+    Some(counts)
+}
+
+/// Count each left row against pre-sorted, group-major records.
+///
+/// Only groups both sides have can contribute, so the rest of `counts` keeps the
+/// zero it was created with.
+fn count_from_sorted<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    left: &SortedRecords<C, T>,
+    right: &SortedRecords<C, T>,
+    slack: T,
+    counts: &mut [u32],
+) {
+    let pairs = paired_group_runs(left, right);
+    let counts = partition::ScatterSlice::new(counts);
+    par_paired_groups_for_each(&pairs, |left_run, right_run| {
+        count_group(
+            &left.records[left_run.0..left_run.1],
+            &right.records[right_run.0..right_run.1],
+            slack,
+            &counts,
+        );
+    });
+}
+
+/// One group's counts, by whichever of the two methods is cheaper for it.
+fn count_group<C: GroupType, T: PositionType>(
+    left: &[IntervalRecord<C, T>],
+    right: &[IntervalRecord<C, T>],
+    slack: T,
+    counts: &partition::ScatterSlice<'_, u32>,
+) {
+    // SAFETY, for every `counts.write` below: a record's `idx` is its input row
+    // number, each row belongs to exactly one group, and each group is visited by
+    // exactly one task — so no index is written twice.
+    if slack >= T::zero()
+        && !group_has_nonpositive_length(right)
+        && formula_beats_sweep(left, right, slack)
+    {
+        let end_bounds = sorted_end_bounds(right, slack);
+        for query in left {
+            let count = count_for_query(query, right, &end_bounds, slack);
+            unsafe { counts.write(query.idx as usize, saturate_u32(count)) };
+        }
+        return;
+    }
+
+    let mut active: Vec<usize> = Vec::new();
+    let mut active_head = 0usize;
+    let mut jr = 0usize;
+
+    for query in left.iter().copied() {
+        let query_end_slack = query.end.saturating_add(slack);
+
+        while jr < right.len() && right[jr].start < query_end_slack {
+            active.push(jr);
+            jr += 1;
+        }
+
+        while active_head < active.len() {
+            let target = right[active[active_head]];
+            if target.end.saturating_add(slack) <= query.start {
+                active_head += 1;
+            } else {
+                break;
+            }
+        }
+
+        if active_head > 0 && active_head * 2 >= active.len() {
+            active.drain(0..active_head);
+            active_head = 0;
+        }
+
+        let mut count = 0_u32;
+        for &index in &active[active_head..] {
+            let target = right[index];
+            if overlaps_with_slack(query.start, query.end, target.start, target.end, slack) {
+                count = count.saturating_add(1);
+            }
+        }
+
+        unsafe { counts.write(query.idx as usize, count) };
+    }
+}
+
+#[inline]
+fn saturate_u32(count: usize) -> u32 {
+    count.min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
@@ -1093,3 +1272,176 @@ mod sorted_records_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod count_overlaps_tests {
+    use super::{count_overlaps, count_overlaps_narrowed};
+
+    /// Deterministic SplitMix64, so these tests need no dev-dependency.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn intervals(
+        state: &mut u64,
+        n: usize,
+        groups: u64,
+        span: u64,
+        max_len: u64,
+    ) -> (Vec<u32>, Vec<i64>, Vec<i64>) {
+        let mut chrs = Vec::with_capacity(n);
+        let mut starts = Vec::with_capacity(n);
+        let mut ends = Vec::with_capacity(n);
+        for _ in 0..n {
+            chrs.push((next(state) % groups) as u32);
+            let start = (next(state) % span) as i64;
+            starts.push(start);
+            ends.push(start + 1 + (next(state) % max_len) as i64);
+        }
+        (chrs, starts, ends)
+    }
+
+    /// Every pair, tested one at a time. Independent of the kernel, so it pins
+    /// the answer rather than restating the algorithm.
+    fn brute_force(
+        chrs: &[u32],
+        starts: &[i64],
+        ends: &[i64],
+        chrs2: &[u32],
+        starts2: &[i64],
+        ends2: &[i64],
+        slack: i64,
+    ) -> Vec<u32> {
+        (0..chrs.len())
+            .map(|q| {
+                (0..chrs2.len())
+                    .filter(|&t| {
+                        chrs2[t] == chrs[q]
+                            && starts[q] < ends2[t] + slack
+                            && starts2[t] < ends[q] + slack
+                    })
+                    .count() as u32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn counts_match_brute_force_on_small_random_input() {
+        let mut state = 0xC0FFEE;
+        for slack in [0_i64, 1, 25] {
+            for _ in 0..20 {
+                let (chrs, starts, ends) = intervals(&mut state, 60, 3, 200, 40);
+                let (chrs2, starts2, ends2) = intervals(&mut state, 60, 4, 200, 40);
+                assert_eq!(
+                    count_overlaps(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, slack),
+                    brute_force(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, slack),
+                    "slack={slack}"
+                );
+            }
+        }
+    }
+
+    /// A group deep enough to take the closed form must agree with a group that
+    /// takes the sweep, and both with the brute force.
+    #[test]
+    fn the_closed_form_and_the_sweep_agree_on_a_deep_pileup() {
+        let mut state = 0xD3E9;
+        // One group, long targets over a short span: every query overlaps most
+        // of the targets, which is the regime `formula_beats_sweep` switches in.
+        let (chrs, starts, ends) = intervals(&mut state, 4_000, 1, 500, 5);
+        let (chrs2, starts2, ends2) = intervals(&mut state, 4_000, 1, 500, 400);
+        assert_eq!(
+            count_overlaps(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0_i64),
+            brute_force(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0),
+        );
+    }
+
+    /// Above `PARALLEL_THRESHOLD` the records are partitioned and the groups are
+    /// counted on separate threads; the answer must not depend on that, and the
+    /// narrowed path must return the same counts as the wide one.
+    #[test]
+    fn parallel_and_narrowed_paths_agree_with_the_wide_one() {
+        let mut state = 0xBEEF;
+        let (chrs, starts, ends) = intervals(&mut state, 150_000, 5, 400_000, 500);
+        let (chrs2, starts2, ends2) = intervals(&mut state, 150_000, 5, 400_000, 500);
+
+        for slack in [0_i64, 250] {
+            let wide = count_overlaps(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, slack);
+            assert_eq!(
+                wide,
+                brute_force_by_group(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, slack),
+                "slack={slack}"
+            );
+            assert_eq!(
+                count_overlaps_narrowed(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, slack),
+                Some(wide),
+                "slack={slack}"
+            );
+        }
+    }
+
+    /// A coordinate, or a slack, too wide for `i32` declines rather than
+    /// truncating — silently wrapping a coordinate is what this pins.
+    #[test]
+    fn coordinates_and_slacks_too_wide_to_narrow_decline() {
+        let mut state = 0x5A5A;
+        let (chrs, mut starts, mut ends) = intervals(&mut state, 150_000, 4, 400_000, 500);
+        let (chrs2, starts2, ends2) = intervals(&mut state, 150_000, 4, 400_000, 500);
+
+        assert!(
+            count_overlaps_narrowed(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0).is_some()
+        );
+        assert!(count_overlaps_narrowed(
+            &chrs,
+            &starts,
+            &ends,
+            &chrs2,
+            &starts2,
+            &ends2,
+            crate::sorts::NARROW_COORDINATE_LIMIT
+        )
+        .is_none());
+
+        starts[7] = crate::sorts::NARROW_COORDINATE_LIMIT + 1;
+        ends[7] = crate::sorts::NARROW_COORDINATE_LIMIT + 11;
+        assert!(
+            count_overlaps_narrowed(&chrs, &starts, &ends, &chrs2, &starts2, &ends2, 0).is_none()
+        );
+    }
+
+    /// The brute force above is O(n*m); at 150k rows it needs the group split.
+    fn brute_force_by_group(
+        chrs: &[u32],
+        starts: &[i64],
+        ends: &[i64],
+        chrs2: &[u32],
+        starts2: &[i64],
+        ends2: &[i64],
+        slack: i64,
+    ) -> Vec<u32> {
+        let mut by_group: std::collections::HashMap<u32, Vec<usize>> = Default::default();
+        for t in 0..chrs2.len() {
+            by_group.entry(chrs2[t]).or_default().push(t);
+        }
+        (0..chrs.len())
+            .map(|q| {
+                by_group
+                    .get(&chrs[q])
+                    .map(|targets| {
+                        targets
+                            .iter()
+                            .filter(|&&t| {
+                                starts[q] < ends2[t] + slack && starts2[t] < ends[q] + slack
+                            })
+                            .count() as u32
+                    })
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+}
+

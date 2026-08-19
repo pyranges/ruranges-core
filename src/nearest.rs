@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use crate::{
-    overlaps::{collect_overlap_pairs_from_sorted, sorted_records, IntervalRecord},
+    overlaps::{collect_overlap_pairs_from_sorted, sorted_records_par, IntervalRecord},
     ruranges_structs::{GroupType, MinEvent, Nearest, OverlapPair, OverlapType, PositionType},
-    sorts::build_sorted_events_single_collection_separate_outputs,
+    sorts::{self, build_sorted_events_single_collection_separate_outputs},
 };
 
 /// Convert pre-sorted IntervalRecord slice into MinEvent vec using the
@@ -360,14 +360,17 @@ where
             rayon::join(
                 || {
                     if want_left_records {
-                        Some(sorted_records(chrs, starts, ends, OverlapType::All))
+                        // The `All` key, built on every core. `sorted_records_par`
+                        // is documented to be element-for-element what the serial
+                        // radix produced for the same key.
+                        Some(sorted_records_par(chrs, starts, ends, false).records)
                     } else {
                         None
                     }
                 },
                 || {
                     if want_right_records {
-                        Some(sorted_records(chrs2, starts2, ends2, OverlapType::All))
+                        Some(sorted_records_par(chrs2, starts2, ends2, false).records)
                     } else {
                         None
                     }
@@ -493,6 +496,74 @@ where
         ties,
         sort_output,
     )
+}
+
+/// [`nearest_with_ties`] over `i64` coordinates narrow enough to sweep as `i32`,
+/// which sorts a third less data for the same answer.
+///
+/// Unlike the sweeps that take their records straight from the counting
+/// partition, `nearest` builds six sorted views of two shapes, so the narrowing
+/// happens once up front: four parallel passes that copy the coordinates as
+/// `i32`, against three radix passes per side that then move two thirds of the
+/// bytes. The distances come back widened, one row per emitted neighbour.
+///
+/// `None` when the narrowing does not apply. The bound is
+/// [`sorts::NARROW_DISTANCE_LIMIT`], not the usual one: a distance is a
+/// *difference* of two coordinates, so the span has to fit, not just each end.
+#[allow(clippy::too_many_arguments)]
+pub fn nearest_with_ties_narrowed<C: GroupType + Send + Sync>(
+    chrs: &[C],
+    starts: &[i64],
+    ends: &[i64],
+    chrs2: &[C],
+    starts2: &[i64],
+    ends2: &[i64],
+    slack: i64,
+    k: usize,
+    include_overlaps: bool,
+    direction: &str,
+    sort_output: bool,
+    ties: Ties,
+) -> Option<(Vec<u32>, Vec<u32>, Vec<i64>)> {
+    if slack.unsigned_abs() >= sorts::NARROW_DISTANCE_LIMIT as u64
+        || !sorts::fits_narrow_within(starts, ends, sorts::NARROW_DISTANCE_LIMIT)
+        || !sorts::fits_narrow_within(starts2, ends2, sorts::NARROW_DISTANCE_LIMIT)
+    {
+        return None;
+    }
+
+    let ((starts, ends), (starts2, ends2)) = rayon::join(
+        || rayon::join(|| narrow(starts), || narrow(ends)),
+        || rayon::join(|| narrow(starts2), || narrow(ends2)),
+    );
+
+    let (left_idx, right_idx, distances) = nearest_with_ties(
+        chrs,
+        &starts,
+        &ends,
+        chrs2,
+        &starts2,
+        &ends2,
+        slack as i32,
+        k,
+        include_overlaps,
+        direction,
+        sort_output,
+        ties,
+    );
+
+    Some((
+        left_idx,
+        right_idx,
+        distances.into_iter().map(i64::from).collect(),
+    ))
+}
+
+/// Coordinates copied as `i32`, in parallel. Every value is in range: the
+/// caller checked before it got here.
+fn narrow(values: &[i64]) -> Vec<i32> {
+    use rayon::prelude::*;
+    values.par_iter().map(|&v| v as i32).collect()
 }
 
 /// Merges three sources of intervals, grouped by `idx`.

@@ -2,8 +2,9 @@ use std::str::FromStr;
 
 use crate::overlaps::{
     clear_active, count_for_query, formula_beats_sweep, group_has_nonpositive_length,
-    overlaps_with_slack, paired_group_runs, par_paired_group_batches,
-    query_contained_in_target_with_slack, sorted_end_bounds, sorted_records_par, IntervalRecord,
+    overlaps_with_slack, pair_fits_narrow, paired_group_runs, par_paired_group_batches,
+    query_contained_in_target_with_slack, sorted_end_bounds, sorted_records_narrowed_par,
+    sorted_records_par, IntervalRecord, SortedRecords,
 };
 use crate::ruranges_structs::{GroupType, OverlapType, PositionType};
 
@@ -62,7 +63,6 @@ pub fn overlap_indices_chunked<C: GroupType + Send + Sync, T: PositionType + Sen
     contained: bool,
 ) -> Vec<Vec<u32>> {
     let overlap_type = OverlapType::from_str(overlap_type).expect("invalid overlap_type string");
-    let keep_all_matches = matches!(overlap_type, OverlapType::All);
 
     // Unlike `overlaps`, this kernel returns only `query.idx` — it never emits a
     // target. The `(group, start, end, idx)` key that `sorted_records` uses for
@@ -71,8 +71,54 @@ pub fn overlap_indices_chunked<C: GroupType + Send + Sync, T: PositionType + Sen
     // key and skip two radsort passes over 24-byte records per side.
     let left = sorted_records_par(chrs, starts, ends, false);
     let right = sorted_records_par(chrs2, starts2, ends2, false);
+    indices_from_sorted(&left, &right, slack, overlap_type, contained)
+}
 
-    let group_pairs = paired_group_runs(&left, &right);
+/// [`overlap_indices_chunked`] over `i64` coordinates narrow enough to sweep as
+/// `i32`, which sorts a third less data for the same answer.
+///
+/// `None` when the narrowing does not apply — see
+/// [`crate::overlaps::sorted_records_narrowed_par`]. The result is row numbers,
+/// so nothing widens back.
+#[allow(clippy::too_many_arguments)]
+pub fn overlap_indices_chunked_narrowed<C: GroupType + Send + Sync>(
+    chrs: &[C],
+    starts: &[i64],
+    ends: &[i64],
+    chrs2: &[C],
+    starts2: &[i64],
+    ends2: &[i64],
+    slack: i64,
+    overlap_type: &str,
+    contained: bool,
+) -> Option<Vec<Vec<u32>>> {
+    let overlap_type = OverlapType::from_str(overlap_type).expect("invalid overlap_type string");
+    if !pair_fits_narrow(starts, ends, starts2, ends2, slack) {
+        return None;
+    }
+
+    let left = sorted_records_narrowed_par(chrs, starts, ends, false)?;
+    let right = sorted_records_narrowed_par(chrs2, starts2, ends2, false)?;
+    Some(indices_from_sorted(
+        &left,
+        &right,
+        slack as i32,
+        overlap_type,
+        contained,
+    ))
+}
+
+/// The per-group driver both entry points share: each group takes the closed
+/// form or the sweep on its own thread.
+fn indices_from_sorted<C: GroupType + Send + Sync, T: PositionType + Send + Sync>(
+    left: &SortedRecords<C, T>,
+    right: &SortedRecords<C, T>,
+    slack: T,
+    overlap_type: OverlapType,
+    contained: bool,
+) -> Vec<Vec<u32>> {
+    let keep_all_matches = matches!(overlap_type, OverlapType::All);
+    let group_pairs = paired_group_runs(left, right);
     par_paired_group_batches(&group_pairs, move |left_run, right_run, out| {
         let left_group = &left.records[left_run.0..left_run.1];
         let right_group = &right.records[right_run.0..right_run.1];
