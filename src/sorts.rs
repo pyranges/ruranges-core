@@ -289,9 +289,18 @@ pub fn slack_fits_narrow(slack: i64) -> bool {
 /// readers hand out `Int64` columns for coordinates that never leave `i32`, so
 /// this is the usual case rather than a special one.
 ///
-/// Returns `None` when the input is too small to be worth partitioning, when a
-/// coordinate is outside [`NARROW_COORDINATE_LIMIT`], or when the counting
-/// partition declines; the caller then stays on its `i64` path.
+/// Returns `None` when the input is too small to be worth partitioning or when
+/// a coordinate is outside [`NARROW_COORDINATE_LIMIT`]; the caller then stays on
+/// its `i64` path.
+///
+/// The counting partition declining is *not* one of those cases. It refuses
+/// high-cardinality frames on purpose — its histogram is one counter per
+/// (block, group), so 500k groups do not fit the budget — but that is a reason
+/// to sort differently, not to give up a third of the bytes. This used to
+/// return `None` there, which meant merge and cluster silently ran wide on
+/// exactly the many-group shapes the narrowing helps most. The whole-array
+/// radix fallback below is what [`build_sorted_intervals_par_inner`] and
+/// `sorted_records_narrowed_par` already do.
 pub fn build_sorted_narrowed_intervals_par<C: GroupType + Send + Sync>(
     chrs: &[C],
     starts: &[i64],
@@ -301,16 +310,29 @@ pub fn build_sorted_narrowed_intervals_par<C: GroupType + Send + Sync>(
         return None;
     }
 
-    let (layout, block_list) = partition::plan_group_major(chrs, 1)?;
-    let runs = layout.group_runs();
-    let mut intervals = partition::scatter_group_major(chrs, &block_list, layout, 1, |row, slots| {
-        slots[0].write(Interval {
-            group: chrs[row],
-            start: starts[row] as i32,
-            end: ends[row] as i32,
-            idx: row as u32,
-        });
-    });
+    let narrowed = |row: usize| Interval {
+        group: chrs[row],
+        start: starts[row] as i32,
+        end: ends[row] as i32,
+        idx: row as u32,
+    };
+
+    let (mut intervals, runs) = match partition::plan_group_major(chrs, 1) {
+        Some((layout, block_list)) => {
+            let runs = layout.group_runs();
+            let intervals =
+                partition::scatter_group_major(chrs, &block_list, layout, 1, |row, slots| {
+                    slots[0].write(narrowed(row));
+                });
+            (intervals, runs)
+        }
+        None => {
+            let mut intervals: Vec<Interval<C, i32>> = (0..chrs.len()).map(narrowed).collect();
+            sort_by_key(&mut intervals, |i| i.group);
+            let runs = partition::runs_by(&intervals, |i| i.group);
+            (intervals, runs)
+        }
+    };
     sort_groups_by_coordinate(&mut intervals, &runs, false);
 
     Some((intervals, runs))
