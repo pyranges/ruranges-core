@@ -133,6 +133,7 @@ fn indices_from_sorted<C: GroupType + Send + Sync, T: PositionType + Send + Sync
             count_indices_in_group(left_group, right_group, slack, keep_all_matches, out);
         } else {
             let mut active = Vec::new();
+            let mut live_bound = Vec::new();
             sweep_indices_in_group(
                 left_group,
                 right_group,
@@ -140,6 +141,7 @@ fn indices_from_sorted<C: GroupType + Send + Sync, T: PositionType + Send + Sync
                 keep_all_matches,
                 contained,
                 &mut active,
+                &mut live_bound,
                 out,
             );
         }
@@ -178,13 +180,31 @@ fn sweep_indices_in_group<C: GroupType, T: PositionType>(
     keep_all_matches: bool,
     contained: bool,
     active: &mut Vec<usize>,
+    live_bound: &mut Vec<T>,
     indices: &mut Vec<u32>,
 ) {
     let mut active_head = 0usize;
     clear_active(active, &mut active_head);
     let mut jr = 0usize;
 
-    for query in left.iter().copied() {
+    // Smallest `end + slack` any remaining query will ask a target to reach.
+    // See `sweep_pairs_in_group`, which retires candidates the same way.
+    if contained {
+        live_bound.clear();
+        live_bound.resize(left.len(), T::zero());
+        let mut smallest: Option<T> = None;
+        for position in (0..left.len()).rev() {
+            let bound = left[position].end.saturating_add(slack);
+            let running = match smallest {
+                Some(current) if current < bound => current,
+                _ => bound,
+            };
+            smallest = Some(running);
+            live_bound[position] = running;
+        }
+    }
+
+    for (position, query) in left.iter().copied().enumerate() {
         if contained {
             let query_start_slack = query.start.saturating_sub(slack);
 
@@ -193,10 +213,24 @@ fn sweep_indices_in_group<C: GroupType, T: PositionType>(
                 jr += 1;
             }
 
-            // See `collect_overlap_pairs_from_sorted`: negative slack may make a
-            // pair contained even when the target ends at the effective query
-            // start. Keep candidates admitted by their start and evaluate the
-            // pair predicate below.
+            // Retire targets no remaining query can be contained by, then test
+            // the rest. The bound is a suffix minimum over the queries still to
+            // come, so nothing the current query could match is dropped, and it
+            // stays correct under negative slack — which can contract a query
+            // until its effective end precedes its effective start. Without it
+            // each query rescanned every target ever admitted, making a
+            // disjoint self-join quadratic in the input for linear output.
+            // See `sweep_pairs_in_group` for the longer version.
+            let bound = live_bound[position];
+            let mut write = active_head;
+            for read in active_head..active.len() {
+                let candidate = active[read];
+                if right[candidate].end >= bound {
+                    active[write] = candidate;
+                    write += 1;
+                }
+            }
+            active.truncate(write);
 
             for idx in active_head..active.len() {
                 let target = right[active[idx]];

@@ -627,3 +627,51 @@ fn a_binary_slack_that_could_overflow_is_declined() {
     )
     .is_none());
 }
+
+/// A disjoint self-join under `contained` must not be quadratic.
+///
+/// The containment branch of the overlap sweep once kept every target admitted
+/// by the start bound and never retired any, so query `k` rechecked the whole
+/// prefix: `N` disjoint intervals produced `N` pairs for `1 + 2 + ... + N` work.
+/// Output equality alone does not catch that -- the answer was right, only the
+/// cost was wrong -- so this measures the shape of the cost instead.
+///
+/// Quadratic work grows ~16x when the input quadruples; linear-ish work grows
+/// ~4x. The bound here is 8x, wide enough to absorb a noisy machine and still
+/// far below what a regression would produce.
+#[test]
+#[ignore = "timing-based; run with --ignored"]
+fn contained_self_join_on_disjoint_intervals_is_not_quadratic() {
+    fn disjoint(n: usize) -> (Vec<u32>, Vec<i64>, Vec<i64>) {
+        let groups = vec![0_u32; n];
+        let starts: Vec<i64> = (0..n).map(|i| i as i64 * 10).collect();
+        let ends: Vec<i64> = starts.iter().map(|start| start + 5).collect();
+        (groups, starts, ends)
+    }
+
+    fn time_pairs(n: usize) -> std::time::Duration {
+        let (groups, starts, ends) = disjoint(n);
+        let started = std::time::Instant::now();
+        let (left, right) = overlaps(
+            &groups, &starts, &ends, &groups, &starts, &ends, 0, "all", false, true,
+        );
+        let elapsed = started.elapsed();
+        // Each interval is contained only in itself.
+        assert_eq!(left.len(), n, "expected one pair per interval");
+        assert_eq!(right.len(), n);
+        elapsed
+    }
+
+    // Warm the allocator and the code path before the measured pair.
+    let _ = time_pairs(20_000);
+
+    let small = time_pairs(50_000);
+    let large = time_pairs(200_000);
+
+    let growth = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    assert!(
+        growth < 8.0,
+        "4x the input cost {growth:.1}x the time ({small:?} -> {large:?}); \
+         the containment sweep looks quadratic again",
+    );
+}

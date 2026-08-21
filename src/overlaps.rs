@@ -522,6 +522,7 @@ pub(crate) fn collect_overlap_pairs_from_sorted<C: GroupType, T: PositionType>(
     let mut i = 0usize;
     let mut j = 0usize;
     let mut active: Vec<usize> = Vec::new();
+    let mut live_bound: Vec<T> = Vec::new();
 
     while i < n1 && j < n2 {
         let g1 = left[i].group;
@@ -564,6 +565,7 @@ pub(crate) fn collect_overlap_pairs_from_sorted<C: GroupType, T: PositionType>(
             overlap_type,
             contained,
             &mut active,
+            &mut live_bound,
             &mut pairs,
         );
     }
@@ -585,13 +587,32 @@ fn sweep_pairs_in_group<C: GroupType, T: PositionType>(
     overlap_type: OverlapType,
     contained: bool,
     active: &mut Vec<usize>,
+    live_bound: &mut Vec<T>,
     pairs: &mut Vec<OverlapPair>,
 ) {
     let mut active_head = 0usize;
     clear_active(active, &mut active_head);
     let mut jr = 0usize;
 
-    for query in left.iter().copied() {
+    // For each query position, the smallest `end + slack` any query from here
+    // on will ask a target to reach. Only needed by the contained branch, which
+    // uses it to retire candidates; see the comment at its use.
+    if contained {
+        live_bound.clear();
+        live_bound.resize(left.len(), T::zero());
+        let mut smallest: Option<T> = None;
+        for position in (0..left.len()).rev() {
+            let bound = left[position].end.saturating_add(slack);
+            let running = match smallest {
+                Some(current) if current < bound => current,
+                _ => bound,
+            };
+            smallest = Some(running);
+            live_bound[position] = running;
+        }
+    }
+
+    for (position, query) in left.iter().copied().enumerate() {
         if contained {
             let query_start_slack = query.start.saturating_sub(slack);
 
@@ -602,15 +623,35 @@ fn sweep_pairs_in_group<C: GroupType, T: PositionType>(
                 jr += 1;
             }
 
-            // Do not expire containment candidates by their end coordinate.
-            // In particular, negative slack can contract a query so far that
-            // its effective end is before its effective start. Such a query
-            // can still satisfy the established pair predicate for a target
-            // ending at (or before) the effective start. Expiring candidates
-            // here made that result depend on whether an earlier long target
-            // prevented the head of this start-sorted list from advancing.
-            // Keep every target admitted by the start bound and let the
-            // predicate below decide each pair independently.
+            // Retire targets that no remaining query can be contained by.
+            //
+            // The pair predicate needs `query.end + slack <= target.end`, so a
+            // target whose end is below the smallest such bound left to come is
+            // dead: no later query can reach it either, because the queries are
+            // in start order and this bound is a suffix minimum. Nothing the
+            // current query could match is dropped — if it matches, its end is
+            // at least this query's bound, which is at least the minimum.
+            //
+            // Retiring by the *current* query's end instead would be the bug
+            // this replaced: ends are not sorted, so a later query with a
+            // smaller end could still have been contained by a target that
+            // rule discarded. Negative slack makes it sharper still, by
+            // contracting a query until its effective end precedes its
+            // effective start. The suffix minimum is safe for either sign.
+            //
+            // Without this, each query rescanned every target ever admitted:
+            // `N` disjoint intervals self-joined cost `1 + 2 + ... + N` to
+            // produce `N` pairs.
+            let bound = live_bound[position];
+            let mut write = active_head;
+            for read in active_head..active.len() {
+                let candidate = active[read];
+                if right[candidate].end >= bound {
+                    active[write] = candidate;
+                    write += 1;
+                }
+            }
+            active.truncate(write);
 
             match overlap_type {
                 OverlapType::All => {
@@ -788,6 +829,7 @@ fn collect_overlap_pairs_par<C: GroupType + Send + Sync, T: PositionType + Send 
     let pairs = paired_group_runs(left, right);
     par_paired_groups(&pairs, |left_run, right_run, out| {
         let mut active = Vec::new();
+        let mut live_bound = Vec::new();
         sweep_pairs_in_group(
             &left.records[left_run.0..left_run.1],
             &right.records[right_run.0..right_run.1],
@@ -795,6 +837,7 @@ fn collect_overlap_pairs_par<C: GroupType + Send + Sync, T: PositionType + Send 
             overlap_type,
             contained,
             &mut active,
+            &mut live_bound,
             out,
         );
     })
