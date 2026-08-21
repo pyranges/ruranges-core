@@ -1,7 +1,10 @@
 use std::str::FromStr;
 
 use crate::{
-    overlaps::{collect_overlap_pairs_from_sorted, sorted_records_par, IntervalRecord},
+    overlaps::{
+        collect_overlap_pairs_from_sorted, sorted_records_narrowed_par, sorted_records_par,
+        IntervalRecord,
+    },
     ruranges_structs::{GroupType, MinEvent, Nearest, OverlapPair, OverlapType, PositionType},
     sorts::{self, build_sorted_events_single_collection_separate_outputs},
 };
@@ -355,6 +358,7 @@ where
 
     // Phase 1: build all sorted views in parallel. The four leaves can run
     // on up to four worker threads.
+    #[allow(clippy::type_complexity)]
     let ((left_records, right_records), (left_by_end, right_by_end)) = rayon::join(
         || {
             rayon::join(
@@ -400,6 +404,47 @@ where
             )
         },
     );
+
+    nearest_from_views(
+        left_records,
+        right_records,
+        left_by_end,
+        right_by_end,
+        slack,
+        k,
+        include_overlaps,
+        dir,
+        sort_output,
+        ties,
+    )
+}
+
+/// Phase 2 of [`nearest_with_ties`]: the three sweeps and the merge, over views
+/// somebody else built.
+///
+/// Split out so the narrowed entry point can build `i32` views straight from
+/// `i64` inputs instead of copying the coordinates first. Everything here reads
+/// the views and never the original coordinate slices, so the two callers differ only
+/// in how the views were produced.
+#[allow(clippy::too_many_arguments)]
+fn nearest_from_views<C: GroupType, T: PositionType>(
+    left_records: Option<Vec<IntervalRecord<C, T>>>,
+    right_records: Option<Vec<IntervalRecord<C, T>>>,
+    left_by_end: Option<Vec<MinEvent<C, T>>>,
+    right_by_end: Option<Vec<MinEvent<C, T>>>,
+    slack: T,
+    k: usize,
+    include_overlaps: bool,
+    dir: Direction,
+    sort_output: bool,
+    ties: Ties,
+) -> (Vec<u32>, Vec<u32>, Vec<T>)
+where
+    C: Send + Sync,
+    T: Send + Sync,
+{
+    let need_left = dir == Direction::Backward || dir == Direction::Any;
+    let need_right = dir == Direction::Forward || dir == Direction::Any;
 
     // Phase 2: run the three sweeps in parallel, each reading from the
     // shared views.
@@ -501,11 +546,16 @@ where
 /// [`nearest_with_ties`] over `i64` coordinates narrow enough to sweep as `i32`,
 /// which sorts a third less data for the same answer.
 ///
-/// Unlike the sweeps that take their records straight from the counting
-/// partition, `nearest` builds six sorted views of two shapes, so the narrowing
-/// happens once up front: four parallel passes that copy the coordinates as
-/// `i32`, against three radix passes per side that then move two thirds of the
-/// bytes. The distances come back widened, one row per emitted neighbour.
+/// `nearest` builds four sorted views, and each builder narrows as it writes —
+/// the same trick `sorted_records_narrowed_par` already used for the binary
+/// sweeps — so no separate copy of the coordinates is materialised. When a
+/// builder declines the input, the four coordinate arrays are narrowed up front
+/// instead and the generic path runs.
+///
+/// This is a memory change, not a speed one: the four copies it avoids are
+/// ~0.9 GB at 10^8 and lower peak RSS by 0.37-0.60 GiB, but they were already
+/// made in parallel and removing them is within noise on wall time. The
+/// distances come back widened, one row per emitted neighbour.
 ///
 /// `None` when the narrowing does not apply. The bound is
 /// [`sorts::NARROW_DISTANCE_LIMIT`], not the usual one: a distance is a
@@ -532,25 +582,88 @@ pub fn nearest_with_ties_narrowed<C: GroupType + Send + Sync>(
         return None;
     }
 
-    let ((starts, ends), (starts2, ends2)) = rayon::join(
-        || rayon::join(|| narrow(starts), || narrow(ends)),
-        || rayon::join(|| narrow(starts2), || narrow(ends2)),
+    let dir = Direction::from_str(direction).unwrap();
+    let need_left = dir == Direction::Backward || dir == Direction::Any;
+    let need_right = dir == Direction::Forward || dir == Direction::Any;
+    let want_left_records = include_overlaps || need_left;
+    let want_right_records = include_overlaps || need_right;
+
+    // Build the views straight from the `i64` inputs, narrowing as each record
+    // is written. The four builders decline together — they take the same
+    // partition decision on the same group column — but each is checked, and
+    // any refusal falls back to narrowing up front and running the generic
+    // path.
+    let built = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    want_left_records
+                        .then(|| sorted_records_narrowed_par(chrs, starts, ends, false))
+                },
+                || {
+                    want_right_records
+                        .then(|| sorted_records_narrowed_par(chrs2, starts2, ends2, false))
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    need_right.then(|| {
+                        sorts::build_sorted_events_narrowed_separate_outputs(chrs, ends, slack)
+                    })
+                },
+                || {
+                    need_left.then(|| {
+                        sorts::build_sorted_events_narrowed_separate_outputs(chrs2, ends2, 0)
+                    })
+                },
+            )
+        },
     );
 
-    let (left_idx, right_idx, distances) = nearest_with_ties(
-        chrs,
-        &starts,
-        &ends,
-        chrs2,
-        &starts2,
-        &ends2,
-        slack as i32,
-        k,
-        include_overlaps,
-        direction,
-        sort_output,
-        ties,
-    );
+    let ((left_records, right_records), (left_by_end, right_by_end)) = built;
+    // `Option<Option<_>>`: the outer is "this view is not needed", the inner is
+    // "the builder declined". Only the second is a reason to fall back.
+    let declined = matches!(left_records, Some(None))
+        || matches!(right_records, Some(None))
+        || matches!(left_by_end, Some(None))
+        || matches!(right_by_end, Some(None));
+
+    let (left_idx, right_idx, distances) = if declined {
+        let ((starts, ends), (starts2, ends2)) = rayon::join(
+            || rayon::join(|| narrow(starts), || narrow(ends)),
+            || rayon::join(|| narrow(starts2), || narrow(ends2)),
+        );
+
+        nearest_with_ties(
+            chrs,
+            &starts,
+            &ends,
+            chrs2,
+            &starts2,
+            &ends2,
+            slack as i32,
+            k,
+            include_overlaps,
+            direction,
+            sort_output,
+            ties,
+        )
+    } else {
+        nearest_from_views(
+            left_records.flatten().map(|sorted| sorted.records),
+            right_records.flatten().map(|sorted| sorted.records),
+            left_by_end.flatten(),
+            right_by_end.flatten(),
+            slack as i32,
+            k,
+            include_overlaps,
+            dir,
+            sort_output,
+            ties,
+        )
+    };
 
     Some((
         left_idx,

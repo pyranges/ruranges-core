@@ -656,6 +656,45 @@ pub fn build_sorted_events_single_collection_separate_outputs<
     out_pos
 }
 
+/// [`build_sorted_events_single_collection_separate_outputs`] over `i64`
+/// positions narrow enough to sweep as `i32`.
+///
+/// Same shape, same order, one difference: the narrowing happens as the events
+/// are written rather than in a pass of its own. `nearest` builds four of these
+/// views, so doing it here is the difference between four extra passes over the
+/// coordinates and none.
+///
+/// `None` when the counting partition declines or the input is too small to be
+/// worth partitioning — the caller then has to narrow up front anyway, so there
+/// is nothing to gain from a serial narrowed path here.
+pub fn build_sorted_events_narrowed_separate_outputs<C: GroupType + Send + Sync>(
+    chrs: &[C],
+    pos: &[i64],
+    slack: i64,
+) -> Option<Vec<MinEvent<C, i32>>> {
+    debug_assert_eq!(chrs.len(), pos.len(), "chrs/pos length mismatch");
+
+    if chrs.len() < partition::PARALLEL_THRESHOLD {
+        return None;
+    }
+    let (layout, block_list) = partition::plan_group_major(chrs, 1)?;
+
+    let runs = layout.group_runs();
+    let mut events = partition::scatter_group_major(chrs, &block_list, layout, 1, |row, slots| {
+        slots[0].write(MinEvent {
+            chr: chrs[row],
+            // The caller has checked that both the coordinates and the slack
+            // fit, so the subtraction is done in `i64` and narrowed after.
+            pos: (pos[row] - slack) as i32,
+            idx: row as u32,
+        });
+    });
+    partition::par_groups_mut(&mut events, &runs, |group| {
+        partition::sort_run_by_key(group, |e| e.pos)
+    });
+    Some(events)
+}
+
 pub fn build_sorted_groups<C: GroupType>(chrs: &[C]) -> Vec<u32> {
     let mut out: Vec<GroupStruct<C>> = (0..chrs.len())
         .map(|i| GroupStruct {
