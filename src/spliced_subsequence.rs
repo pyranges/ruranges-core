@@ -47,9 +47,9 @@ pub fn spliced_subseq<G: GroupType, T: PositionType>(
     if shift > T::zero() {
         let mut s = Vec::with_capacity(starts.len());
         let mut e = Vec::with_capacity(ends.len());
-        for i in 0..starts.len() {
-            s.push(starts[i] + shift);
-            e.push(ends[i] + shift);
+        for (&orig_start, &orig_end) in starts.iter().zip(ends) {
+            s.push(orig_start + shift);
+            e.push(orig_end + shift);
         }
         _tmp_storage = Some((s, e));
         let (s_ref, e_ref) = _tmp_storage.as_ref().unwrap();
@@ -240,9 +240,9 @@ pub fn spliced_subseq_multi<G: GroupType, T: PositionType>(
     if shift > T::zero() {
         let mut s = Vec::with_capacity(starts.len());
         let mut e = Vec::with_capacity(ends.len());
-        for i in 0..starts.len() {
-            s.push(starts[i] + shift);
-            e.push(ends[i] + shift);
+        for (&orig_start, &orig_end) in starts.iter().zip(ends) {
+            s.push(orig_start + shift);
+            e.push(orig_end + shift);
         }
         _tmp_storage = Some((s, e));
         let (s_ref, e_ref) = _tmp_storage.as_ref().unwrap();

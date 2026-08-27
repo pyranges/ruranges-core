@@ -22,11 +22,9 @@ pub fn outside_bounds<G: GroupType, T: PositionType>(
     let mut out_starts = Vec::with_capacity(n);
     let mut out_ends = Vec::with_capacity(n);
 
-    for i in 0..n {
-        let size = chrom_lens[i];
-        let orig_start = starts[i];
-        let orig_end = ends[i];
-
+    for (i, ((&orig_start, &orig_end), &size)) in
+        starts.iter().zip(ends).zip(chrom_lens).enumerate()
+    {
         if !clip {
             // ===== Removal mode =========================================
             let skip = if only_right {
