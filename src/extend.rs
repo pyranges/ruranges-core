@@ -39,21 +39,21 @@ pub fn extend_grp<G: GroupType, T: PositionType>(
 
     let mut extrema: HashMap<G, (usize /*min_i*/, usize /*max_i*/)> = HashMap::with_capacity(n);
 
-    for i in 0..n {
+    for (i, ((&group_id, &start), &end)) in group_ids.iter().zip(starts).zip(ends).enumerate() {
         extrema
-            .entry(group_ids[i])
+            .entry(group_id)
             .and_modify(|(min_i, max_i)| {
-                if starts[i] < starts[*min_i] {
+                if start < starts[*min_i] {
                     *min_i = i;
                 }
-                if ends[i] > ends[*max_i] {
+                if end > ends[*max_i] {
                     *max_i = i;
                 }
             })
             .or_insert((i, i));
     }
 
-    for (_gid, (min_i, max_i)) in extrema {
+    for (_group_id, (min_i, max_i)) in extrema {
         if negative_strand[min_i] {
             new_end[max_i] = new_end[max_i] + ext_5;
             new_start[min_i] = new_start[min_i] - ext_3;
