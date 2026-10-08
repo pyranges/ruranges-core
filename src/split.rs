@@ -1,6 +1,9 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rayon::prelude::*;
 
 use crate::{
+    partition,
     ruranges_structs::{Event, GroupType, PositionType},
     sorts,
 };
@@ -14,23 +17,92 @@ pub fn sweep_line_split<G: GroupType + Send + Sync, T: PositionType + Send + Syn
 ) -> (Vec<u32>, Vec<T>, Vec<T>) {
     let events = build_events_of_nonempty_rows(chrs, starts, ends, slack);
 
-    // These will hold the output arrays: each emitted subinterval’s
-    // (original_idx, start, end).
-    let mut idxs_out = Vec::new();
-    let mut starts_out = Vec::new();
-    let mut ends_out = Vec::new();
+    // No atom spans two chromosomes, so each chromosome is swept on its own
+    // task, batched as merge batches groups. A first pass counts each batch's
+    // atoms, so that the second writes them straight to their place in the
+    // output, in chromosome order: the order a single sweep emits them in.
+    let runs = partition::runs_by(&events, |e| e.chr);
+    let batches: Vec<&[Event<G, T>]> =
+        partition::batch_runs(&runs, partition::BATCH_ROWS, |&(s, e)| e - s)
+            .into_iter()
+            .map(|batch| &events[runs[batch.start].0..runs[batch.end - 1].1])
+            .collect();
+    let counts: Vec<usize> = batches
+        .par_iter()
+        .map(|&batch| {
+            let mut count = 0;
+            sweep(batch, between, None, |_, _, _| count += 1);
+            count
+        })
+        .collect();
+    let mut slots = Vec::with_capacity(counts.len());
+    let mut total = 0;
+    for count in counts {
+        slots.push((total, total + count));
+        total += count;
+    }
 
+    let ended: Vec<AtomicU64> = (0..starts.len().div_ceil(64))
+        .map(|_| AtomicU64::new(0))
+        .collect();
+    let mut idxs_out: Vec<u32> = Vec::with_capacity(total);
+    let mut starts_out: Vec<T> = Vec::with_capacity(total);
+    let mut ends_out: Vec<T> = Vec::with_capacity(total);
+    partition::split_runs_mut(&mut idxs_out.spare_capacity_mut()[..total], &slots)
+        .into_par_iter()
+        .zip(partition::split_runs_mut(
+            &mut starts_out.spare_capacity_mut()[..total],
+            &slots,
+        ))
+        .zip(partition::split_runs_mut(
+            &mut ends_out.spare_capacity_mut()[..total],
+            &slots,
+        ))
+        .zip(batches.par_iter())
+        .for_each(|(((idxs, atom_starts), atom_ends), &batch)| {
+            let mut written = 0;
+            sweep(batch, between, Some(&ended), |idx, start, end| {
+                idxs[written].write(idx);
+                atom_starts[written].write(start);
+                atom_ends[written].write(end);
+                written += 1;
+            });
+            assert_eq!(written, idxs.len(), "both passes emit the same atoms");
+        });
+    // SAFETY: the slots tile 0..total, and every one was written above.
+    unsafe {
+        idxs_out.set_len(total);
+        starts_out.set_len(total);
+        ends_out.set_len(total);
+    }
+    (idxs_out, starts_out, ends_out)
+}
+
+/// Split one or more whole chromosomes of sorted events into atoms, passing
+/// each to `emit` as (index, start, end).
+///
+/// With `ended`, a covered atom's index names the innermost interval still open
+/// over it. `ended` is shared by every task, one bit per row; a task only ever
+/// reads the bits of its own chromosomes' rows, which it wrote itself. Without
+/// it the sweep only finds the atoms, which is all the counting pass needs.
+fn sweep<G: GroupType, T: PositionType>(
+    events: &[Event<G, T>],
+    between: bool,
+    ended: Option<&[AtomicU64]>,
+    mut emit: impl FnMut(u32, T, T),
+) {
     // Edge case: no intervals
     if events.is_empty() {
-        return (idxs_out, starts_out, ends_out);
+        return;
     }
 
     // The intervals open at the sweep line, innermost last. An interval that
     // has ended stays on the stack until it reaches the top, and is marked in
     // `ended` so it can be recognised then; each is pushed and popped once.
     let mut open: Vec<u32> = Vec::new();
-    let mut ended = vec![0_u64; starts.len().div_ceil(64)];
-    let is_ended = |ended: &[u64], idx: u32| ended[idx as usize / 64] >> (idx % 64) & 1 == 1;
+    let is_ended = |ended: &[AtomicU64], idx: u32| {
+        ended[idx as usize / 64].load(Ordering::Relaxed) >> (idx % 64) & 1 == 1
+    };
 
     // State for the sweep line
     let mut current_chr = events[0].chr;
@@ -44,7 +116,9 @@ pub fn sweep_line_split<G: GroupType + Send + Sync, T: PositionType + Send + Syn
     // If the first event is a start, coverage goes from 0 → 1 at that point.
     if events[0].is_start {
         active_count = 1;
-        open.push(events[0].idx);
+        if ended.is_some() {
+            open.push(events[0].idx);
+        }
     }
 
     // We iterate from the *second* event onward.
@@ -61,7 +135,7 @@ pub fn sweep_line_split<G: GroupType + Send + Sync, T: PositionType + Send + Syn
             last_pos = e.pos;
             last_idx = e.idx;
             open.clear();
-            if e.is_start {
+            if e.is_start && ended.is_some() {
                 open.push(e.idx);
             }
             continue;
@@ -74,17 +148,16 @@ pub fn sweep_line_split<G: GroupType + Send + Sync, T: PositionType + Send + Syn
             if active_count > 0 || between {
                 // A covered atom belongs to the innermost interval still open;
                 // a gap belongs to none, and keeps the index of the event before it.
-                let attribution = if active_count == 0 {
-                    last_idx
-                } else {
-                    while is_ended(&ended, open[open.len() - 1]) {
-                        open.pop();
+                let attribution = match ended {
+                    Some(ended) if active_count > 0 => {
+                        while is_ended(ended, open[open.len() - 1]) {
+                            open.pop();
+                        }
+                        open[open.len() - 1]
                     }
-                    open[open.len() - 1]
+                    _ => last_idx,
                 };
-                idxs_out.push(attribution);
-                starts_out.push(last_pos);
-                ends_out.push(e.pos);
+                emit(attribution, last_pos, e.pos);
             }
             last_pos = e.pos;
             last_idx = e.idx;
@@ -93,17 +166,19 @@ pub fn sweep_line_split<G: GroupType + Send + Sync, T: PositionType + Send + Syn
         // Now handle the event itself (this flips coverage up or down).
         if e.is_start {
             active_count += 1;
-            open.push(e.idx);
+            if ended.is_some() {
+                open.push(e.idx);
+            }
         } else {
             // is an end
             if active_count > 0 {
                 active_count -= 1;
             }
-            ended[e.idx as usize / 64] |= 1 << (e.idx % 64);
+            if let Some(ended) = ended {
+                ended[e.idx as usize / 64].fetch_or(1 << (e.idx % 64), Ordering::Relaxed);
+            }
         }
     }
-
-    (idxs_out, starts_out, ends_out)
 }
 
 /// The sorted events of every row that covers at least one position.
@@ -214,6 +289,37 @@ mod tests {
                     assert_eq!(got, want, "n={n} slack={slack}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn chromosomes_swept_in_parallel_match_one_serial_sweep() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Well over BATCH_ROWS events, so several tasks share the bitset.
+        let n: usize = 300_000;
+        let chrs: Vec<u32> = (0..n).map(|_| (next() % 24) as u32).collect();
+        let starts: Vec<i64> = (0..n).map(|_| (next() % 1_000_000) as i64).collect();
+        let ends: Vec<i64> = starts.iter().map(|&s| s + (next() % 400) as i64).collect();
+        for between in [false, true] {
+            let events = build_events_of_nonempty_rows(&chrs, &starts, &ends, 0);
+            let ended: Vec<AtomicU64> = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+            let mut serial = (Vec::new(), Vec::new(), Vec::new());
+            sweep(&events, between, Some(&ended), |idx, start, end| {
+                serial.0.push(idx);
+                serial.1.push(start);
+                serial.2.push(end);
+            });
+            assert_eq!(
+                sweep_line_split(&chrs, &starts, &ends, 0, between),
+                serial,
+                "between={between}"
+            );
         }
     }
 
