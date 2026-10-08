@@ -317,6 +317,24 @@ pub fn build_sorted_narrowed_intervals_par<C: GroupType + Send + Sync>(
         idx: row as u32,
     };
 
+    // As in `build_sorted_intervals_par_inner`: nothing to sort when the input is
+    // already in (group, start) order, and the check short-circuits when it is not.
+    let block_list = partition::blocks(chrs.len());
+    if is_input_group_coord_sorted(chrs, starts, ends, &block_list, false) {
+        let mut intervals: Vec<Interval<C, i32>> = Vec::with_capacity(chrs.len());
+        partition::split_runs_mut(intervals.spare_capacity_mut(), &block_list)
+            .into_par_iter()
+            .zip(block_list.par_iter())
+            .for_each(|(target, &(start, end))| {
+                for (slot, row) in target.iter_mut().zip(start..end) {
+                    slot.write(narrowed(row));
+                }
+            });
+        // SAFETY: every slot in 0..len was written above.
+        unsafe { intervals.set_len(chrs.len()) };
+        return Some((intervals, partition::runs_by(chrs, |chr| *chr)));
+    }
+
     let (mut intervals, runs) = match partition::plan_group_major(chrs, 1) {
         Some((layout, block_list)) => {
             let runs = layout.group_runs();
@@ -1051,6 +1069,29 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn narrowed_interval_builder_matches_serial() {
+        let mut state = 0x7777;
+        // Both input orders, so the presorted fast path and the partition both run.
+        for sorted in [false, true] {
+            for &groups in &[1_u32, 24] {
+                let (chrs, starts, ends) = random_input(&mut state, 150_000, groups, sorted);
+                let serial = build_sorted_intervals(&chrs, &starts, &ends, None, 0, false);
+                let (narrowed, runs) =
+                    build_sorted_narrowed_intervals_par(&chrs, &starts, &ends).expect("fits i32");
+                assert_eq!(
+                    serial.iter().map(interval_key).collect::<Vec<_>>(),
+                    narrowed
+                        .iter()
+                        .map(|iv| (iv.group, iv.start as i64, iv.end as i64, iv.idx))
+                        .collect::<Vec<_>>(),
+                    "sorted={sorted} groups={groups}"
+                );
+                assert_eq!(runs, partition::runs_by(&serial, |iv| iv.group));
             }
         }
     }
