@@ -67,11 +67,11 @@ pub fn sweep_line_non_overlaps<G: GroupType, T: PositionType>(
                 if !overlapped.contains(&e.idx) {
                     no_overlaps.push(e.idx);
                 }
+                overlapped.remove(&e.idx);
             } else {
+                // `overlapped` holds set-1 indices; this one is from set 2.
                 active2.remove(&e.idx);
             }
-
-            overlapped.remove(&e.idx);
         }
     }
 
@@ -79,4 +79,51 @@ pub fn sweep_line_non_overlaps<G: GroupType, T: PositionType>(
         radsort::sort(&mut no_overlaps);
     }
     no_overlaps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sweep_line_non_overlaps;
+
+    /// Deterministic SplitMix64, so these tests need no dev-dependency.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn a_set2_end_does_not_clear_the_set1_row_sharing_its_index() {
+        // [0,10) is row 0 of set 1 and overlaps [2,4), row 0 of set 2.
+        let free = sweep_line_non_overlaps(&[0u32], &[0i64], &[10], &[0u32], &[2], &[4], 0, true);
+        assert!(free.is_empty());
+    }
+
+    #[test]
+    fn non_overlapping_rows_match_brute_force() {
+        let mut state = 0xC0_4E7_u64;
+        for trial in 0..2000 {
+            let n1 = 1 + (next(&mut state) % 9) as usize;
+            let n2 = 1 + (next(&mut state) % 9) as usize;
+            let mut make = |n: usize| -> (Vec<u32>, Vec<i64>, Vec<i64>) {
+                let c: Vec<u32> = (0..n).map(|_| (next(&mut state) % 2) as u32).collect();
+                let s: Vec<i64> = (0..n).map(|_| (next(&mut state) % 40) as i64).collect();
+                let e: Vec<i64> = s
+                    .iter()
+                    .map(|&x| x + 1 + (next(&mut state) % 9) as i64)
+                    .collect();
+                (c, s, e)
+            };
+            let (c1, s1, e1) = make(n1);
+            let (c2, s2, e2) = make(n2);
+            let want: Vec<u32> = (0..n1)
+                .filter(|&i| !(0..n2).any(|j| c1[i] == c2[j] && s2[j] < e1[i] && s1[i] < e2[j]))
+                .map(|i| i as u32)
+                .collect();
+            let got = sweep_line_non_overlaps(&c1, &s1, &e1, &c2, &s2, &e2, 0, true);
+            assert_eq!(got, want, "trial={trial}");
+        }
+    }
 }
