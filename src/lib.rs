@@ -2,6 +2,7 @@ pub mod boundary;
 pub mod cluster;
 pub mod complement;
 pub mod complement_single;
+mod count_overlaps;
 pub mod extend;
 pub mod group_cumsum;
 pub mod helpers;

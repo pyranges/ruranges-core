@@ -388,7 +388,9 @@ where
                 || {
                     if need_left {
                         Some(build_sorted_events_single_collection_separate_outputs(
-                            chrs2, ends2, T::zero(),
+                            chrs2,
+                            ends2,
+                            T::zero(),
                         ))
                     } else {
                         None
@@ -436,6 +438,68 @@ where
         }
     };
 
+    if k == 1 && ties == Ties::All {
+        // Keep only the boundary of each nearest endpoint bucket. Expanding
+        // every tie here can produce a large intermediate result that the final
+        // merge discards when an overlap or the other direction wins.
+        let compute_left = || {
+            let mut positions = Vec::new();
+            if need_left {
+                positions.resize(chrs.len(), usize::MAX);
+                let targets = right_by_end.as_ref().unwrap();
+                let mut j = 0;
+                for query in left_records.as_ref().unwrap() {
+                    let limit = query.start - slack;
+                    while j < targets.len()
+                        && (targets[j].chr < query.group
+                            || (targets[j].chr == query.group && targets[j].pos <= limit))
+                    {
+                        j += 1;
+                    }
+                    if j > 0 && targets[j - 1].chr == query.group {
+                        positions[query.idx as usize] = j - 1;
+                    }
+                }
+            }
+            positions
+        };
+        let compute_right = || {
+            let mut positions = Vec::new();
+            if need_right {
+                positions.resize(chrs.len(), usize::MAX);
+                let targets = right_records.as_ref().unwrap();
+                let mut j = 0;
+                for query in left_by_end.as_ref().unwrap() {
+                    while j < targets.len()
+                        && (targets[j].group < query.chr
+                            || (targets[j].group == query.chr && targets[j].start < query.pos))
+                    {
+                        j += 1;
+                    }
+                    if j < targets.len() && targets[j].group == query.chr {
+                        positions[query.idx as usize] = j;
+                    }
+                }
+            }
+            positions
+        };
+        let ((overlaps, left), right) = rayon::join(
+            || rayon::join(compute_overlaps, compute_left),
+            compute_right,
+        );
+        return merge_nearest_one(
+            starts,
+            ends,
+            slack,
+            &overlaps,
+            &left,
+            &right,
+            right_by_end.as_deref().unwrap_or(&[]),
+            right_records.as_deref().unwrap_or(&[]),
+            sort_output,
+        );
+    }
+
     let compute_left = || -> Vec<Nearest<T>> {
         if need_left {
             let l = left_records
@@ -482,8 +546,10 @@ where
     // Run the three independent producers in parallel via nested rayon::join.
     // rayon::join is cheap on small inputs: the calling thread runs one closure
     // inline and only yields the other for stealing if a worker is idle.
-    let ((overlaps, nearest_left), nearest_right) =
-        rayon::join(|| rayon::join(compute_overlaps, compute_left), compute_right);
+    let ((overlaps, nearest_left), nearest_right) = rayon::join(
+        || rayon::join(compute_overlaps, compute_left),
+        compute_right,
+    );
 
     merge_three_way_by_index_distance(
         &overlaps,
@@ -493,6 +559,87 @@ where
         ties,
         sort_output,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_nearest_one<C: GroupType, T: PositionType>(
+    starts: &[T],
+    ends: &[T],
+    slack: T,
+    overlaps: &[OverlapPair],
+    left: &[usize],
+    right: &[usize],
+    left_targets: &[MinEvent<C, T>],
+    right_targets: &[IntervalRecord<C, T>],
+    sort_output: bool,
+) -> (Vec<u32>, Vec<u32>, Vec<T>) {
+    let capacity = starts.len().max(overlaps.len());
+    let mut indices = Vec::with_capacity(capacity);
+    let mut targets = Vec::with_capacity(capacity);
+    let mut distances = Vec::with_capacity(capacity);
+    let mut overlap_pos = 0;
+    for q in 0..starts.len() {
+        let begin = targets.len();
+        while overlap_pos < overlaps.len() && overlaps[overlap_pos].idx == q as u32 {
+            targets.push(overlaps[overlap_pos].idx2);
+            overlap_pos += 1;
+        }
+        if targets.len() != begin {
+            indices.resize(targets.len(), q as u32);
+            distances.resize(targets.len(), T::zero());
+            continue;
+        }
+
+        let l = left.get(q).copied().unwrap_or(usize::MAX);
+        let r = right.get(q).copied().unwrap_or(usize::MAX);
+        let dl = left_targets
+            .get(l)
+            .map(|t| starts[q] - slack - t.pos + T::one());
+        let dr = right_targets
+            .get(r)
+            .map(|t| t.start - (ends[q] - slack) + T::one());
+        let distance = match (dl, dr) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => continue,
+        };
+        let keep_left = dl == Some(distance);
+        let keep_right = dr == Some(distance);
+        if keep_left {
+            let target = &left_targets[l];
+            let mut lo = l;
+            while lo > 0
+                && left_targets[lo - 1].chr == target.chr
+                && left_targets[lo - 1].pos == target.pos
+            {
+                lo -= 1;
+            }
+            // Stable endpoint sorting leaves equal endpoints in original-index
+            // order. The unsorted legacy result traverses left ties backwards.
+            if sort_output {
+                targets.extend(left_targets[lo..=l].iter().map(|t| t.idx));
+            } else {
+                targets.extend(left_targets[lo..=l].iter().rev().map(|t| t.idx));
+            }
+        }
+        if keep_right {
+            let target = &right_targets[r];
+            let mut hi = r + 1;
+            while hi < right_targets.len()
+                && right_targets[hi].group == target.group
+                && right_targets[hi].start == target.start
+            {
+                hi += 1;
+            }
+            targets.extend(right_targets[r..hi].iter().map(|t| t.idx));
+        }
+        if sort_output && keep_left && keep_right {
+            targets[begin..].sort_unstable();
+        }
+        indices.resize(targets.len(), q as u32);
+        distances.resize(targets.len(), distance);
+    }
+    (indices, targets, distances)
 }
 
 /// Merges three sources of intervals, grouped by `idx`.
@@ -1013,6 +1160,202 @@ mod tests {
             Ties::All,
         );
         assert_eq!(bare, explicit);
+    }
+
+    type Row = (u32, i64, i64);
+
+    fn check_one(left: &[Row], right: &[Row], slack: i64) {
+        let g: Vec<_> = left.iter().map(|r| r.0).collect();
+        let s: Vec<_> = left.iter().map(|r| r.1).collect();
+        let e: Vec<_> = left.iter().map(|r| r.2).collect();
+        let h: Vec<_> = right.iter().map(|r| r.0).collect();
+        let t: Vec<_> = right.iter().map(|r| r.1).collect();
+        let u: Vec<_> = right.iter().map(|r| r.2).collect();
+        for direction in ["any", "forward", "backward"] {
+            for include in [false, true] {
+                for sorted in [false, true] {
+                    let mut expected = (Vec::new(), Vec::new(), Vec::new());
+                    for (q, &(group, start, end)) in left.iter().enumerate() {
+                        let mut candidates = Vec::new();
+                        for (i, &(g2, s2, e2)) in right.iter().enumerate() {
+                            if group != g2 {
+                                continue;
+                            }
+                            if include
+                                && start < e2.saturating_add(slack)
+                                && s2 < end.saturating_add(slack)
+                            {
+                                candidates.push((0, 0, i));
+                            }
+                            if direction != "forward" && e2 <= start - slack {
+                                candidates.push((start - slack - e2 + 1, 1, i));
+                            }
+                            if direction != "backward" && s2 >= end - slack {
+                                candidates.push((s2 - (end - slack) + 1, 2, i));
+                            }
+                        }
+                        let Some(distance) = candidates.iter().map(|c| c.0).min() else {
+                            continue;
+                        };
+                        candidates.retain(|c| c.0 == distance);
+                        candidates.sort_unstable_by_key(|&(_, side, i)| {
+                            if sorted {
+                                (0, i)
+                            } else {
+                                (side, if side == 1 { usize::MAX - i } else { i })
+                            }
+                        });
+                        for (_, _, i) in candidates {
+                            expected.0.push(q as u32);
+                            expected.1.push(i as u32);
+                            expected.2.push(distance);
+                        }
+                    }
+                    assert_eq!(
+                        nearest(&g, &s, &e, &h, &t, &u, slack, 1, include, direction, sorted),
+                        expected,
+                        "slack {slack}, {direction}, overlaps {include}, sorted {sorted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nearest_one_keeps_all_ties_and_legacy_unsorted_order() {
+        let left = [(1, 100, 110), (2, 100, 110), (3, 0, 1)];
+        let right = [
+            (1, 80, 90),
+            (1, 120, 130),
+            (2, 105, 106),
+            (1, 120, 140),
+            (1, 70, 90),
+            (2, 90, 100),
+            (2, 110, 120),
+        ];
+        for slack in [-5, 0, 5] {
+            check_one(&left, &right, slack);
+        }
+        let (_, indices, distances) = nearest(
+            &[1_u32],
+            &[100_i64],
+            &[110],
+            &[1, 1, 2, 1, 1, 2, 2],
+            &[80, 120, 105, 120, 70, 90, 110],
+            &[90, 130, 106, 140, 90, 100, 120],
+            0,
+            1,
+            false,
+            "any",
+            false,
+        );
+        assert_eq!(indices, [4, 0, 1, 3]);
+        assert_eq!(distances, [11, 11, 11, 11]);
+    }
+
+    #[test]
+    fn nearest_one_randomized_matches_independent_oracle() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                let mut seed = 187_u64;
+                let mut random = || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                for case in 0..100 {
+                    let mut make = |n| {
+                        (0..n)
+                            .map(|_| {
+                                let group = (random() % 7) as u32;
+                                let start = (random() % 61) as i64 - 30;
+                                let end = start + (random() % 17) as i64 - 4;
+                                (group, start, end)
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let left = make(case % 37);
+                    let right = make((case * 7) % 43);
+                    for slack in [-7, 0, 7] {
+                        check_one(&left, &right, slack);
+                    }
+                }
+            });
+    }
+
+    #[test]
+    fn nearest_one_radix_inputs_include_missing_groups_and_discarded_ties() {
+        let mut right = Vec::new();
+        for i in 0..400 {
+            right.push((i % 3, 100, 120));
+        }
+        right.extend([(0, -100, 1000), (1, -100, 1000)]);
+        let left: Vec<_> = (0..280).map(|i| (i % 4, (i % 10) as i64, 20)).collect();
+        check_one(&left, &right, 0);
+        check_one(&[], &right, 0);
+        check_one(&left, &[], 0);
+    }
+
+    #[test]
+    fn nearest_one_integer_limits_and_signed_groups() {
+        for sorted in [false, true] {
+            for slack in [-1, 0, 1] {
+                let output = nearest(
+                    &[-2_i32, 7],
+                    &[i32::MIN + 10, i32::MAX - 10],
+                    &[i32::MIN + 12, i32::MAX - 8],
+                    &[7, -2],
+                    &[i32::MAX - 5, i32::MIN + 2],
+                    &[i32::MAX - 2, i32::MIN + 5],
+                    slack,
+                    1,
+                    true,
+                    "any",
+                    sorted,
+                );
+                assert_eq!(output, (vec![0, 1], vec![1, 0], vec![6 - slack, 4 + slack]));
+            }
+        }
+        let left = [
+            (0, i64::MIN + 10, i64::MIN + 12),
+            (1, i64::MAX - 10, i64::MAX - 8),
+        ];
+        let right = [
+            (1, i64::MAX - 5, i64::MAX - 2),
+            (0, i64::MIN + 2, i64::MIN + 5),
+        ];
+        for slack in [-1, 0, 1] {
+            check_one(&left, &right, slack);
+        }
+    }
+
+    #[test]
+    fn nearest_general_k_and_zero_keep_existing_behavior() {
+        for (k, expected) in [
+            (0, (vec![0], vec![1], vec![0])),
+            (2, (vec![0, 0, 0], vec![1, 0, 2], vec![0, 11, 11])),
+        ] {
+            assert_eq!(
+                nearest(
+                    &[1_u32],
+                    &[100_i64],
+                    &[110],
+                    &[1, 1, 1],
+                    &[80, 105, 120],
+                    &[90, 106, 130],
+                    0,
+                    k,
+                    true,
+                    "any",
+                    true,
+                ),
+                expected,
+            );
+        }
     }
 
     #[test]

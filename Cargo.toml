@@ -1,10 +1,11 @@
 [package]
 name = "ruranges-core"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 license = "MIT"
 description = "Core Rust interval algorithms extracted from ruranges"
 repository = "https://github.com/pyranges/ruranges-core"
+exclude = [".claude/**"]
 
 [lib]
 name = "ruranges_core"
