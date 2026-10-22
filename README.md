@@ -47,10 +47,6 @@ directional candidates or a combined result vector. Required ties and the
 existing sorted/unsorted output order are preserved; `Ties::First` and general
 `k` keep their existing paths.
 
-Run `python3 benchmarks/nearest.py` for isolated release comparisons. See the
-[nearest benchmark report](benchmarks/nearest.md) for results at 100k and one
-million rows, single/four-thread measurements, validation, and limitations.
-
 ## Overlap performance
 
 Ordinary overlap reporting unlinks expired targets while preserving start order
@@ -62,12 +58,6 @@ semantics are preserved. Containment retains its existing traversal.
 
 Small record collections use stable comparison sorting; larger collections use
 radix sorting.
-
-Run `python3 benchmarks/overlaps.py` for release-mode comparisons against the
-kernel at `HEAD`, or pass `--baseline-ref` to select a revision. The runner uses
-scratch crates, checks exact output equality, and alternates baseline/candidate
-measurement order. See [benchmark results](benchmarks/overlaps.md) for workloads,
-commands, and measured tradeoffs.
 
 ## Counting performance
 
@@ -81,8 +71,3 @@ An exact Fenwick-tree sweep preserves the existing predicate for queries where
 rank subtraction is invalid, including zero-length queries, negative slack,
 reversed right intervals, and saturation at integer limits. Duplicates count
 individually, results stay in input order, and final counts saturate at `u32::MAX`.
-
-Run `python3 benchmarks/count_overlaps.py` to compare the previous kernel,
-binary searches, sorted scans, and the selected strategy. See the
-[counting benchmark report](benchmarks/count_overlaps.md) for results and
-reproduction commands, including workloads where the fallback is slower.

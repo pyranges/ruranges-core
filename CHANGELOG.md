@@ -9,7 +9,7 @@
 - `count_overlaps` uses endpoint ranks and sorted scans or binary searches,
   with direct checks for tiny inputs. An exact Fenwick-tree fallback preserves
   zero-length/reversed interval, negative-slack, and saturation behavior.
-  Some sparse fallback-heavy workloads are slower; see the benchmark report.
+  Some sparse fallback-heavy workloads are slower.
 - For `k=1` with `Ties::All`, nearest retains endpoint-bucket references and
   expands only the winning ties. It assembles results directly in query order,
   avoiding discarded candidate vectors and intermediate result sorts.
@@ -18,9 +18,8 @@
   revisiting every active left interval at each right-side coverage boundary.
   Zero-length and reversed intervals produce no left fragments and remove no
   right-side coverage; this fixes bogus fragments from empty intervals.
-- Add reproducible Rust benchmark runners, raw results, and performance notes
-  for overlaps, counting, and nearest. Preserve all fixes and public APIs from
-  0.1.13, including contracted negative-slack containment and nearest tie policies.
+- Preserve all fixes and public APIs from 0.1.13, including contracted
+  negative-slack containment and nearest tie policies.
 
 ## 0.1.13
 
