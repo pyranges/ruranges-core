@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.15
+
+- Complement omits empty and reversed terminal gaps. Nonnegative slack filters
+  internal and terminal gaps without shifting the coordinates of surviving gaps
+  or overflowing when interval ends are near the coordinate type's maximum.
+  Optional leading gaps and negative-slack end contraction retain their behavior.
+
 ## 0.1.14
 
 - Ordinary overlap reporting removes expired targets throughout the candidate

@@ -5,6 +5,13 @@ use crate::{
     sorts,
 };
 
+/// Report gaps between covered intervals, optionally including a leading gap
+/// from zero and terminal gaps for groups present in `chrom_lens`.
+///
+/// Nonnegative `slack` suppresses internal and terminal gaps of at most that
+/// length without shifting the coordinates of surviving gaps. Leading gaps
+/// are controlled only by `include_first_interval`. Negative slack retains
+/// the existing behavior of contracting interval ends before the sweep.
 pub fn sweep_line_complement<G: GroupType, T: PositionType>(
     chrs: &[G],
     starts: &[T],
@@ -23,8 +30,11 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
         return (out_chrs, out_starts, out_ends, out_idxs);
     }
 
-    // Build your events array, sorted by chr and pos
-    let events = sorts::build_sorted_events_single_collection(chrs, starts, ends, slack);
+    // Positive slack filters gaps; it must not move their genomic boundaries.
+    // Keep the existing contracted-event behavior for negative slack.
+    let event_slack = slack.min(T::zero());
+    let min_gap = slack.max(T::zero());
+    let events = sorts::build_sorted_events_single_collection(chrs, starts, ends, event_slack);
 
     // Initialize
     let mut current_chr = events[0].chr;
@@ -33,6 +43,8 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
     let mut in_complement = include_first_interval;
     // Start the first hole at position 0 of the chromosome (only matters if `in_complement == true`)
     let mut current_start = T::zero();
+    // Leading gaps have no preceding interval, so slack does not suppress them.
+    let mut gap_slack = T::zero();
     // Must start at the first event's index, not at 0: row 0 of the caller's
     // input need not belong to the first group in sorted order, in which case a
     // hardcoded 0 attributes the group's gaps to an unrelated row.
@@ -44,7 +56,7 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
             // If we ended the previous chromosome still in a hole,
             // optionally close it out at the chromosome’s end
             if let Some(chlen) = chrom_lens.get(&current_chr) {
-                if in_complement {
+                if in_complement && current_start.saturating_add(gap_slack) < *chlen {
                     out_chrs.push(current_chr);
                     out_starts.push(current_start);
                     out_ends.push(*chlen);
@@ -57,6 +69,7 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
             active_count = 0;
             in_complement = include_first_interval;
             current_start = T::zero();
+            gap_slack = T::zero();
             current_index = e.idx;
         }
 
@@ -65,14 +78,15 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
             // coverage X → X + 1
             active_count += 1;
             // If coverage was zero, we just ended a hole
-            if active_count == 1 && in_complement && current_start != e.pos {
-                // That hole ends at e.pos
-                out_chrs.push(current_chr);
-                out_starts.push(current_start);
-                out_ends.push(e.pos);
-                out_idxs.push(current_index);
+            if active_count == 1 && in_complement {
+                if current_start.saturating_add(gap_slack) < e.pos {
+                    out_chrs.push(current_chr);
+                    out_starts.push(current_start);
+                    out_ends.push(e.pos);
+                    out_idxs.push(current_index);
+                }
 
-                // We're no longer in a hole
+                // Coverage resumes even when the gap was suppressed by slack.
                 in_complement = false;
             }
         } else {
@@ -83,13 +97,14 @@ pub fn sweep_line_complement<G: GroupType, T: PositionType>(
             if active_count == 0 {
                 in_complement = true;
                 current_start = e.pos;
+                gap_slack = min_gap;
             }
         }
     }
 
     // End of all events: if we finished in a hole and have chromosome lengths
     if let Some(chlen) = chrom_lens.get(&current_chr) {
-        if in_complement {
+        if in_complement && current_start.saturating_add(gap_slack) < *chlen {
             out_chrs.push(current_chr);
             out_starts.push(current_start);
             out_ends.push(*chlen);
