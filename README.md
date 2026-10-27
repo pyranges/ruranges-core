@@ -71,3 +71,12 @@ An exact Fenwick-tree sweep preserves the existing predicate for queries where
 rank subtraction is invalid, including zero-length queries, negative slack,
 reversed right intervals, and saturation at integer limits. Duplicates count
 individually, results stay in input order, and final counts saturate at `u32::MAX`.
+
+## Transcript projection
+
+`map_to_global` and `map_to_global_with_exons` accept unsorted queries and exon
+annotations. The core sorts numeric row indices only when necessary and clips
+each query to the exon coverage. Exon local spans must not overlap within a
+transcript. With `sort_output=true`, fragments follow original query and exon
+row order; returned indices always refer to the original inputs. The exon-aware
+form additionally returns the annotation row that produced each fragment.

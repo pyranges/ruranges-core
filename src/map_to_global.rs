@@ -16,11 +16,28 @@ struct ProjectedFragment<T: PositionType> {
     exon: u32,
 }
 
+/// Return a stable row permutation only when the input needs sorting.
+fn projection_order<G: GroupType, T: PositionType>(groups: &[G], starts: &[T]) -> Option<Vec<u32>> {
+    if (1..groups.len()).all(|i| (groups[i - 1], starts[i - 1]) <= (groups[i], starts[i])) {
+        return None;
+    }
+    let mut order: Vec<u32> = (0..groups.len() as u32).collect();
+    sort_by_key(&mut order, |&i| starts[i as usize]);
+    sort_by_key(&mut order, |&i| groups[i as usize]);
+    Some(order)
+}
+
 /// Project local coordinates onto genomic ones, reporting only the query rows.
 ///
 /// [`map_to_global_with_exons`] additionally reports which annotation row
 /// produced each fragment, which callers need when they carry annotation
 /// metadata onto the output.
+///
+/// Inputs may be in any row order. Exons must describe non-overlapping local
+/// spans within each transcript. Only query/exon intersections are projected;
+/// portions outside exon coverage are omitted. With `sort_output`, fragments
+/// follow the original query and annotation row order. Otherwise they
+/// follow the sweep's (transcript, query start, local exon start) order.
 #[allow(clippy::too_many_arguments)]
 pub fn map_to_global<G: GroupType, T: PositionType>(
     /* left  table (exons / annotation) */
@@ -92,6 +109,11 @@ pub fn map_to_global_with_exons<G: GroupType, T: PositionType>(
     debug_assert_eq!(q_tx.len(), q_end.len());
     debug_assert_eq!(q_tx.len(), q_fwd.len());
 
+    let ex_order = projection_order(ex_tx, ex_local_start);
+    let q_order = projection_order(q_tx, q_start);
+    let ex_row = |i: usize| ex_order.as_ref().map_or(i, |order| order[i] as usize);
+    let q_row = |i: usize| q_order.as_ref().map_or(i, |order| order[i] as usize);
+
     // ------------------- output buffers -----------------------------------
     let mut results = Vec::new();
 
@@ -102,16 +124,16 @@ pub fn map_to_global_with_exons<G: GroupType, T: PositionType>(
     let q_n = q_tx.len();
 
     while qi < q_n {
-        let tx_code = q_tx[qi];
+        let tx_code = q_tx[q_row(qi)];
 
         // move exon pointer to this transcript (or beyond)
-        while ei < ex_n && ex_tx[ei] < tx_code {
+        while ei < ex_n && ex_tx[ex_row(ei)] < tx_code {
             ei += 1;
         }
 
         // if no exons for this transcript, skip its queries
-        if ei >= ex_n || ex_tx[ei] != tx_code {
-            while qi < q_n && q_tx[qi] == tx_code {
+        if ei >= ex_n || ex_tx[ex_row(ei)] != tx_code {
+            while qi < q_n && q_tx[q_row(qi)] == tx_code {
                 qi += 1;
             }
             continue;
@@ -122,38 +144,53 @@ pub fn map_to_global_with_exons<G: GroupType, T: PositionType>(
         // ------------------------------------------------------------
         let mut ej = ei; // exon cursor inside tx
 
-        while qi < q_n && q_tx[qi] == tx_code {
-            let mut l = q_start[qi];
-            let lend = q_end[qi];
-            let idx = qi as u32; // row number into query table
-            let local_f = q_fwd[qi];
+        while qi < q_n && q_tx[q_row(qi)] == tx_code {
+            let mut l = q_start[q_row(qi)];
+            let lend = q_end[q_row(qi)];
+            let idx = q_row(qi) as u32; // row number into query table
+            let local_f = q_fwd[q_row(qi)];
 
             // advance exon cursor until its end is after l
-            while ej < ex_n && ex_tx[ej] == tx_code && ex_local_end[ej] <= l {
+            while ej < ex_n && ex_tx[ex_row(ej)] == tx_code && ex_local_end[ex_row(ej)] <= l {
                 ej += 1;
             }
 
             let mut ek = ej;
-            while l < lend && ek < ex_n && ex_tx[ek] == tx_code {
-                let el_start = ex_local_start[ek];
-                let el_end = ex_local_end[ek];
+            while l < lend && ek < ex_n && ex_tx[ex_row(ek)] == tx_code {
+                let el_start = ex_local_start[ex_row(ek)];
+                let el_end = ex_local_end[ex_row(ek)];
 
                 if l >= el_end {
                     ek += 1;
                     continue;
                 }
 
-                // clip to current exon
-                let seg_end_local = if lend < el_end { lend } else { el_end };
+                // Intersect both boundaries before translating. A query before
+                // the first exon or inside a local gap must not extrapolate.
+                let seg_start_local = l.max(el_start);
+                let seg_end_local = lend.min(el_end);
+                if seg_start_local >= seg_end_local {
+                    if el_start >= lend {
+                        break;
+                    }
+                    ek += 1;
+                    continue;
+                }
 
                 // translate to genome
-                let offset1 = l - el_start;
+                let offset1 = seg_start_local - el_start;
                 let offset2 = seg_end_local - el_start;
 
-                let (g_start, g_end) = if ex_fwd[ek] {
-                    (ex_genome_start[ek] + offset1, ex_genome_start[ek] + offset2)
+                let (g_start, g_end) = if ex_fwd[ex_row(ek)] {
+                    (
+                        ex_genome_start[ex_row(ek)] + offset1,
+                        ex_genome_start[ex_row(ek)] + offset2,
+                    )
                 } else {
-                    (ex_genome_end[ek] - offset2, ex_genome_end[ek] - offset1)
+                    (
+                        ex_genome_end[ex_row(ek)] - offset2,
+                        ex_genome_end[ex_row(ek)] - offset1,
+                    )
                 };
 
                 // push result
@@ -161,8 +198,8 @@ pub fn map_to_global_with_exons<G: GroupType, T: PositionType>(
                     start: g_start,
                     end: g_end,
                     idx,
-                    fwd: local_f == ex_fwd[ek],
-                    exon: ek as u32,
+                    fwd: local_f == ex_fwd[ex_row(ek)],
+                    exon: ex_row(ek) as u32,
                 });
 
                 // advance inside query
@@ -177,13 +214,13 @@ pub fn map_to_global_with_exons<G: GroupType, T: PositionType>(
         }
 
         // skip remaining exons of this transcript
-        while ei < ex_n && ex_tx[ei] == tx_code {
+        while ei < ex_n && ex_tx[ex_row(ei)] == tx_code {
             ei += 1;
         }
     }
 
     if sort_output {
-        sort_by_key(&mut results, |i| i.idx);
+        sort_by_key(&mut results, |i| (i.idx, i.exon));
     }
 
     let mut out_idxs = Vec::with_capacity(results.len());
