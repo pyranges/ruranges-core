@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.15
 
 - Complement omits empty and reversed terminal gaps. Nonnegative slack filters
   internal and terminal gaps without shifting the coordinates of surviving gaps
