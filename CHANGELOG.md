@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.16
+
+- Transcript projection sorts unsorted query and exon inputs in Rust, while
+  retaining original query and exon row indices. Already-sorted inputs skip
+  permutation allocation. Queries are clipped to both local exon boundaries;
+  out-of-coverage portions no longer extrapolate into genomic coordinates.
+
 ## 0.1.15
 
 - Complement omits empty and reversed terminal gaps. Nonnegative slack filters
